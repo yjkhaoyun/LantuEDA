@@ -1,0 +1,30 @@
+[Setup]
+; 商业软件基础信息
+AppName=蓝兔智营 EDA
+AppVersion=1.0.0
+AppPublisher=宁波蓝兔智营科技有限公司
+AppCopyright=Copyright (C) 2026 宁波蓝兔智营科技有限公司
+
+; 默认安装到 C:\Program Files\Lantugo_EDA
+DefaultDirName={autopf}\Lantugo_EDA
+DefaultGroupName=蓝兔智营 EDA
+
+; 打包输出的路径和文件名
+OutputDir=@CMAKE_BINARY_DIR@\installer_output
+OutputBaseFilename=Lantugo_EDA_v1.0.0_Setup
+
+; 启用极限压缩算法 (将几个G的产物压缩到几百兆)
+Compression=lzma2/ultra64
+SolidCompression=yes
+PrivilegesRequired=admin
+
+[Files]
+; 1. 自动抓取 CMake install 目录下的所有零散文件 (咱们自己编译的产物)
+Source: "@CMAKE_INSTALL_PREFIX@\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; 2. 自动去 vcpkg 仓库抓取所有的第三方图形库/底层引擎 DLL (省去手动复制！)
+Source: "@CMAKE_BINARY_DIR@\vcpkg_installed\x64-windows\bin\*.dll"; DestDir: "{app}\bin"; Flags: ignoreversion
+[Icons]
+; 自动在用户桌面和开始菜单生成快捷方式，直接指向 bin 里面的 kicad.exe
+Name: "{autodesktop}\蓝兔智营 EDA"; Filename: "{app}\bin\kicad.exe"; WorkingDir: "{app}\bin"
+Name: "{group}\蓝兔智营 EDA"; Filename: "{app}\bin\kicad.exe"; WorkingDir: "{app}\bin"
