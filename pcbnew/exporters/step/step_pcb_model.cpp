@@ -4127,7 +4127,7 @@ bool STEP_PCB_MODEL::WriteGLTF( const wxString& aFileName )
     metadata.Add( TCollection_AsciiString( "source_pcb_file" ),
                   TCollection_ExtendedString( fn.GetFullName().wc_str() ) );
     metadata.Add( TCollection_AsciiString( "generator" ),
-                  TCollection_AsciiString( wxString::Format( wxS( "KiCad %s" ), GetSemanticVersion() ).ToAscii() ) );
+                  TCollection_AsciiString( wxString::Format( wxS( "LantuEDA %s" ), GetSemanticVersion() ).ToAscii() ) );
     metadata.Add( TCollection_AsciiString( "generated_at" ),
                   TCollection_AsciiString( GetISO8601CurrentDateTime().ToAscii() ) );
 
@@ -4208,7 +4208,7 @@ bool STEP_PCB_MODEL::WritePLY( const wxString& aFileName )
     metadata.Add( TCollection_AsciiString( "source_pcb_file" ),
                   TCollection_ExtendedString( fn.GetFullName().wc_str() ) );
     metadata.Add( TCollection_AsciiString( "generator" ),
-                  TCollection_AsciiString( wxString::Format( wxS( "KiCad %s" ),
+                  TCollection_AsciiString( wxString::Format( wxS( "LantuEDA %s" ),
                                                              GetSemanticVersion() ).ToAscii() ) );
     metadata.Add( TCollection_AsciiString( "generated_at" ),
                   TCollection_AsciiString( GetISO8601CurrentDateTime().ToAscii() ) );
