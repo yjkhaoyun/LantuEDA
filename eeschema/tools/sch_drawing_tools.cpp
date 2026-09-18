@@ -75,9 +75,11 @@
 #include <wx/msgdlg.h>
 #include <wx/utils.h>
 
+// 引入 WebView 和 JSON 解析器 (蓝兔智营专属)
+#include <wx/webview.h>
+#include <nlohmann/json.hpp>
 
 using SCOPED_DRAW_MODE = SCOPED_SET_RESET<SCH_DRAWING_TOOLS::MODE>;
-
 
 SCH_DRAWING_TOOLS::SCH_DRAWING_TOOLS() :
         SCH_TOOL_BASE<SCH_EDIT_FRAME>( "eeschema.InteractiveDrawing" ),
@@ -96,7 +98,6 @@ SCH_DRAWING_TOOLS::SCH_DRAWING_TOOLS() :
         m_inDrawingTool( false )
 {
 }
-
 
 bool SCH_DRAWING_TOOLS::Init()
 {
@@ -131,6 +132,61 @@ bool SCH_DRAWING_TOOLS::Init()
 
     return true;
 }
+
+// ==========================================
+// 🚀 蓝兔智营：内嵌商城对话框类
+// ==========================================
+class DIALOG_LANTU_MALL : public wxDialog
+{
+public:
+    wxString m_selectedLibId; // 用来接收网页传回来的元器件ID
+
+    DIALOG_LANTU_MALL( wxWindow* parent )
+        : wxDialog( parent, wxID_ANY, _("蓝兔智营 - 云端元器件商城"), wxDefaultPosition, wxSize( 1200, 800 ), wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxMAXIMIZE_BOX )
+    {
+        wxBoxSizer* sizer = new wxBoxSizer( wxVERTICAL );
+        
+        // 核心：在对话框里嵌入你们的 Web 商城
+        m_webView = wxWebView::New( this, wxID_ANY, "http://localhost:3000/mall?action=select_symbol" );
+        
+        if ( m_webView )
+        {
+            sizer->Add( m_webView, 1, wxEXPAND, 0 );
+            
+            // 建立 C++ 与 JS 的秘密通讯通道，名字叫 "LantuEdaBridge"
+            m_webView->AddScriptMessageHandler( "LantuEdaBridge" );
+            Bind( wxEVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, &DIALOG_LANTU_MALL::OnWebMessage, this );
+        }
+        SetSizer( sizer );
+        Center();
+    }
+
+    // 当网页里的 JS 发送消息过来时，会瞬间触发这个 C++ 函数
+    void OnWebMessage( wxWebViewEvent& event )
+    {
+        wxString msg = event.GetString();
+        try 
+        {
+            // 解析网页传过来的 JSON 字符串
+            auto j = nlohmann::json::parse( msg.ToStdString() );
+            if ( j.contains("action") && j["action"] == "place_symbol" ) 
+            {
+                // 提取真实元器件 ID，存入 C++ 变量
+                if( j.contains("lib_id") )
+                    m_selectedLibId = wxString::FromUTF8( j["lib_id"].get<std::string>() );
+                
+                // 收到数据，光速关闭商城弹窗，并返回成功信号
+                EndModal( wxID_OK ); 
+            }
+        } 
+        catch( ... ) 
+        {
+            // 忽略非 JSON 格式的干扰信息
+        }
+    }
+private:
+    wxWebView* m_webView;
+};
 
 
 int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
@@ -355,7 +411,7 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 m_toolMgr->RunAction( ACTIONS::selectionClear );
 
                 SYMBOL_LIBRARY_ADAPTER* libs = PROJECT_SCH::SymbolLibAdapter( &m_frame->Prj() );
-                LEGACY_SYMBOL_LIB*       cache = PROJECT_SCH::LegacySchLibs( &m_frame->Prj() )->GetCacheLibrary();
+                LEGACY_SYMBOL_LIB*      cache = PROJECT_SCH::LegacySchLibs( &m_frame->Prj() )->GetCacheLibrary();
 
                 std::set<UTF8>             unique_libid;
                 std::vector<PICKED_SYMBOL> alreadyPlaced;
@@ -383,19 +439,15 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                     }
                 }
 
-                // ==========================================
-                // 🚀 【蓝兔智营 EDA 核心注入点】 🚀
-                // ==========================================
-                // 1. 强行唤起本地浏览器，打开蓝兔智营云端选型中心
-                // wxLaunchDefaultBrowser 可以在跨平台环境下直接打开网址
-                wxLaunchDefaultBrowser( wxT("http://localhost:3000/mall?action=select_symbol") );
+                DIALOG_LANTU_MALL mallDialog( m_frame );
+                if( mallDialog.ShowModal() != wxID_OK || mallDialog.m_selectedLibId.IsEmpty() )
+                {
+                    continue; 
+                }
 
-                // 2. 伪造一个选中的结果骗过 KiCad 的底层引擎！
-                // (后期这里你要写一段代码，接收你网页传回来的真实元器件库名称)
                 PICKED_SYMBOL sel;
+                sel.LibId.Parse( mallDialog.m_selectedLibId );
                 
-                // 这里我直接把咱们今天辛辛苦苦拉下来的那个 BGA 内存芯片强行注入进去！
-                sel.LibId.Parse( wxT("Lantugo_Lib:H5TC4G63EFR-RDAR_0") );
                 // 设置为默认放置单次
                 sel.KeepSymbol = false;
                 sel.PlaceAllUnits = false;
@@ -2522,7 +2574,7 @@ int SCH_DRAWING_TOOLS::DrawRuleArea( const TOOL_EVENT& aEvent )
                 }
             }
         }
-        else if( started && (   evt->IsAction( &ACTIONS::deleteLastPoint )
+        else if( started && (  evt->IsAction( &ACTIONS::deleteLastPoint )
                              || evt->IsAction( &ACTIONS::doDelete )
                              || evt->IsAction( &ACTIONS::undo ) ) )
         {

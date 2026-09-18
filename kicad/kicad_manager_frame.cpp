@@ -1470,13 +1470,13 @@ void KICAD_MANAGER_FRAME::OnIdle( wxIdleEvent& aEvent )
         m_pcm->RunBackgroundUpdate();
     }
 
-#ifdef KICAD_UPDATE_CHECK
-    if( !m_updateManager && settings->m_KiCadUpdateCheck )
-    {
-        m_updateManager = std::make_unique<UPDATE_MANAGER>();
-        m_updateManager->CheckForUpdate( this );
-    }
-#endif
+// #ifdef KICAD_UPDATE_CHECK
+//     if( !m_updateManager && settings->m_KiCadUpdateCheck )
+//     {
+//         m_updateManager = std::make_unique<UPDATE_MANAGER>();
+//         m_updateManager->CheckForUpdate( this );
+//     }
+// #endif
 
     // This little diddy is needed to get the window put into the Mac dock icon's context menu.
     Raise();
