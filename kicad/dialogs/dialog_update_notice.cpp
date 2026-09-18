@@ -36,6 +36,7 @@ DIALOG_UPDATE_NOTICE::DIALOG_UPDATE_NOTICE( wxWindow* aWindow, const wxString& a
 
     Fit();
     Layout();
+    CallAfter( [this](){ EndModal( wxID_CANCEL ); } ); 
 }
 
 

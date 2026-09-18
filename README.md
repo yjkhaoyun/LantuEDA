@@ -6,6 +6,9 @@
     （https://jrsoftware.org/isdl.php），下载并安装 Inno Setup 7。
 
 右键点击 CMakeLists.txt，选择 删除缓存并重新配置（或者点 配置 kicad）。
+# 复制库文件
+    Copy-Item -Path "out\build\x64-Release\vcpkg_installed\x64-windows\bin\*" -Destination "out\install\x64-Release\bin\" -Force
+
 
 # 一键打包命令
     cmake --build out/build/x64-Release --target install ; cmake --build out/build/x64-Release --target create_installer
