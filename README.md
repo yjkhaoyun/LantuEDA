@@ -15,6 +15,9 @@
 
 # 安装包位于 kicad\out\build\x64-Release\installer_output\
 
+# 与嘉立创兼容： 
+    在嘉立创专业版 打开PCB项目 文件 → 导出 → PADS   导出后解压  然后再LantuEDA的pcb中文件 → 导入 → 非kicad文件  选择PCB1.asc打开
+
 
 
 
