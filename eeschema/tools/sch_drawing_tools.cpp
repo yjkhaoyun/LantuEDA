@@ -134,60 +134,70 @@ bool SCH_DRAWING_TOOLS::Init()
 }
 
 // ==========================================
-// 🚀 蓝兔智营：内嵌商城对话框类
+// 🚀 蓝兔智营：内嵌商城对话框类 (商用最终版)
 // ==========================================
 class DIALOG_LANTU_MALL : public wxDialog
 {
 public:
-    wxString m_selectedLibId; // 用来接收网页传回来的元器件ID
+    wxString m_selectedLibId; 
+    wxString m_symbolUrl;     
 
     DIALOG_LANTU_MALL( wxWindow* parent )
         : wxDialog( parent, wxID_ANY, _("蓝兔智营 - 云端元器件商城"), wxDefaultPosition, wxSize( 1200, 800 ), wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxMAXIMIZE_BOX )
     {
         wxBoxSizer* sizer = new wxBoxSizer( wxVERTICAL );
         
-        // 核心：在对话框里嵌入你们的 Web 商城
-        m_webView = wxWebView::New( this, wxID_ANY, "http://localhost:3000/mall?action=select_symbol" );
+        // 1. 先加载空页面，确保注入 LantuEdaBridge 后再跳转，防止前端找不到对象
+        m_webView = wxWebView::New( this, wxID_ANY, "about:blank" );
         
         if ( m_webView )
         {
             sizer->Add( m_webView, 1, wxEXPAND, 0 );
             
-            // 建立 C++ 与 JS 的秘密通讯通道，名字叫 "LantuEdaBridge"
             m_webView->AddScriptMessageHandler( "LantuEdaBridge" );
             Bind( wxEVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, &DIALOG_LANTU_MALL::OnWebMessage, this );
+            
+            // 拦截新窗口跳转（如数据手册），调用系统默认浏览器打开
+            Bind( wxEVT_WEBVIEW_NEWWINDOW, &DIALOG_LANTU_MALL::OnNewWindow, this );
+
+            // 跳转到真实地址
+            m_webView->LoadURL( "http://localhost:3000/search?action=select_symbol" );
         }
         SetSizer( sizer );
         Center();
     }
 
-    // 当网页里的 JS 发送消息过来时，会瞬间触发这个 C++ 函数
     void OnWebMessage( wxWebViewEvent& event )
     {
         wxString msg = event.GetString();
         try 
         {
-            // 解析网页传过来的 JSON 字符串
             auto j = nlohmann::json::parse( msg.ToStdString() );
             if ( j.contains("action") && j["action"] == "place_symbol" ) 
             {
-                // 提取真实元器件 ID，存入 C++ 变量
-                if( j.contains("lib_id") )
-                    m_selectedLibId = wxString::FromUTF8( j["lib_id"].get<std::string>() );
+                if( j.contains("lib_id") ) m_selectedLibId = wxString::FromUTF8( j["lib_id"].get<std::string>() );
+                if( j.contains("sym_url") ) m_symbolUrl = wxString::FromUTF8( j["sym_url"].get<std::string>() );
                 
-                // 收到数据，光速关闭商城弹窗，并返回成功信号
                 EndModal( wxID_OK ); 
             }
         } 
-        catch( ... ) 
-        {
-            // 忽略非 JSON 格式的干扰信息
-        }
+        catch( ... ) {}
     }
+
+    void OnNewWindow( wxWebViewEvent& event )
+    {
+        wxLaunchDefaultBrowser( event.GetURL() );
+        event.Veto(); 
+    }
+
 private:
     wxWebView* m_webView;
 };
 
+
+#include <wx/filename.h>
+#include <sch_io/sch_io_mgr.h>
+#include <sch_io/sch_io.h>
 
 int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 {
@@ -195,9 +205,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
     SCH_SYMBOL* symbol = toolParams.m_Symbol;
 
-    // If we get a parameterised symbol, we probably just want to place that and get out of the placement tool,
-    // rather than popping up the chooser afterwards.  A multi-unit symbol may still request that its remaining
-    // units be placed before the tool exits.
     bool placeOneOnly = symbol != nullptr;
 
     SYMBOL_LIBRARY_FILTER       filter;
@@ -218,12 +225,10 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
     EE_GRID_HELPER        grid( m_toolMgr );
     VECTOR2I              cursorPos;
 
-    // First we need to get all instances of this sheet so we can annotate whatever symbols we place on all copies
     SCH_SHEET_LIST hierarchy = m_frame->Schematic().Hierarchy();
     SCH_SHEET_LIST newInstances = hierarchy.FindAllSheetsForScreen( m_frame->GetCurrentSheet().LastScreen() );
     newInstances.SortByPageNumbers();
 
-    // Get a list of all references in the schematic to avoid duplicates wherever they're placed
     SCH_REFERENCE_LIST existingRefs;
     hierarchy.GetSymbols( existingRefs, SYMBOL_FILTER_ALL );
     existingRefs.SortByReferenceOnly();
@@ -242,7 +247,7 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         wxFAIL_MSG( "PlaceSymbol(): unexpected request" );
     }
 
-    TOOL_EVENT         originalEvent = aEvent;          // This can change out from under us when the event loop runs
+    TOOL_EVENT         originalEvent = aEvent;
     SCOPED_TOOL_PUSHER raii( m_frame, originalEvent );
 
     auto addSymbol =
@@ -254,9 +259,8 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 aSymbol->SetFlags( IS_NEW | IS_MOVING );
 
                 m_view->ClearPreview();
-                m_view->AddToPreview( aSymbol, false );   // Add, but not give ownership
+                m_view->AddToPreview( aSymbol, false );
 
-                // Set IS_MOVING again, as AddItemToCommitAndScreen() will have cleared it.
                 aSymbol->SetFlags( IS_MOVING );
                 m_toolMgr->PostAction( ACTIONS::refreshPreview );
             };
@@ -285,7 +289,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
             {
                 EESCHEMA_SETTINGS* cfg = m_frame->eeconfig();
 
-                // Then we need to annotate all instances by sheet
                 for( SCH_SHEET_PATH& instance : newInstances )
                 {
                     SCH_REFERENCE newReference( symbol, instance );
@@ -302,7 +305,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
                         refs.UpdateAnnotation();
 
-                        // Update existing refs for next iteration
                         for( size_t i = 0; i < refs.GetCount(); i++ )
                             existingRefs.AddItem( refs[i] );
                     }
@@ -313,13 +315,9 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
     Activate();
 
-    // Must be done after Activate() so that it gets set into the correct context
     getViewControls()->ShowCursor( true );
-
-    // Set initial cursor
     setCursor();
 
-    // Prime the pump
     if( symbol )
     {
         addSymbol( symbol );
@@ -327,9 +325,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         if( toolParams.m_Reannotate )
             annotate();
 
-        // Seed the placed-reference list so multi-unit stepping sees this symbol's first unit
-        // as taken.  The chooser path seeds it when it builds the symbol; this path bypasses
-        // that branch.
         SCH_REFERENCE placedSymbolReference( symbol, m_frame->GetCurrentSheet() );
         existingRefs.AddItem( placedSymbolReference );
         existingRefs.SortByReferenceOnly();
@@ -346,7 +341,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         ignorePrimePosition = true;
     }
 
-    // Main loop: keep receiving events
     while( TOOL_EVENT* evt = Wait() )
     {
         setCursor();
@@ -356,7 +350,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         cursorPos = grid.Align( controls->GetMousePosition(), GRID_HELPER_GRIDS::GRID_CONNECTABLE );
         controls->ForceCursorPosition( true, cursorPos );
 
-        // The tool hotkey is interpreted as a click when drawing
         bool isSyntheticClick = symbol && evt->IsActivate() && evt->HasPosition() && evt->Matches( aEvent );
 
         if( evt->IsCancelInteractive() || ( symbol && evt->IsAction( &ACTIONS::undo ) ) )
@@ -369,7 +362,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
                 if( keepSymbol )
                 {
-                    // Re-enter symbol chooser
                     m_toolMgr->PostAction( ACTIONS::cursorClick );
                 }
             }
@@ -382,7 +374,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         {
             if( symbol && evt->IsMoveTool() )
             {
-                // we're already moving our own item; ignore the move tool
                 evt->SetPassEvent( false );
                 continue;
             }
@@ -396,7 +387,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
             if( evt->IsMoveTool() )
             {
-                // Make sure we come back after the move tool runs
                 frame()->PushTool( originalEvent );
             }
 
@@ -408,61 +398,106 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         {
             if( !symbol )
             {
-                m_toolMgr->RunAction( ACTIONS::selectionClear );
-
-                SYMBOL_LIBRARY_ADAPTER* libs = PROJECT_SCH::SymbolLibAdapter( &m_frame->Prj() );
-                LEGACY_SYMBOL_LIB*      cache = PROJECT_SCH::LegacySchLibs( &m_frame->Prj() )->GetCacheLibrary();
-
-                std::set<UTF8>             unique_libid;
-                std::vector<PICKED_SYMBOL> alreadyPlaced;
-
-                for( SCH_SHEET_PATH& sheet : hierarchy )
-                {
-                    for( SCH_ITEM* item : sheet.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
-                    {
-                        SCH_SYMBOL* s = static_cast<SCH_SYMBOL*>( item );
-
-                        if( !unique_libid.insert( s->GetLibId().Format() ).second )
-                            continue;
-
-                        LIB_SYMBOL* libSymbol = SchGetLibSymbol( s->GetLibId(), libs, cache );
-
-                        if( libSymbol )
-                        {
-                            if( libSymbol->IsPower() != filter.GetFilterPowerSymbols() )
-                                continue;
-
-                            PICKED_SYMBOL pickedSymbol;
-                            pickedSymbol.LibId = libSymbol->GetLibId();
-                            alreadyPlaced.push_back( pickedSymbol );
-                        }
-                    }
+                // 只在放置常规符号(快捷键A)时触发商城，放置电源符号(快捷键P)暂时跳过
+                if ( !aEvent.IsAction( &SCH_ACTIONS::placeSymbol ) ) {
+                    m_frame->ShowInfoBarError(_("电源等其他符号请使用原生库。"));
+                    break;
                 }
 
+                m_toolMgr->RunAction( ACTIONS::selectionClear );
+
                 DIALOG_LANTU_MALL mallDialog( m_frame );
-                if( mallDialog.ShowModal() != wxID_OK || mallDialog.m_selectedLibId.IsEmpty() )
+                int dialogResult = wxID_CANCEL;
+
+                // 🌟 致命修复 1：协程栈弹窗会卡死或失效，必须用 RunMainStack 运行 UI
+                RunMainStack( [&]() {
+                    dialogResult = mallDialog.ShowModal();
+                });
+
+                if( dialogResult != wxID_OK || mallDialog.m_selectedLibId.IsEmpty() || mallDialog.m_symbolUrl.IsEmpty() )
                 {
                     continue; 
                 }
 
-                PICKED_SYMBOL sel;
-                sel.LibId.Parse( mallDialog.m_selectedLibId );
+                m_frame->ShowInfoBarMsg( _( "正在从云端下载模型..." ) );
+
+                wxString safeLibId = mallDialog.m_selectedLibId;
+                safeLibId.Replace("/", "_"); safeLibId.Replace("\\", "_");
+
+                wxString tempDir = wxFileName::GetTempDir();
+                wxString tempFilePath = tempDir + wxFileName::GetPathSeparator() + safeLibId + ".kicad_sym";
                 
-                // 设置为默认放置单次
+                if (wxFileExists(tempFilePath)) {
+                    wxRemoveFile(tempFilePath); 
+                }
+
+// 🌟 致命修复 2：使用纯字符串调用 curl（完美兼容当前 wxWidgets 版本），并剔除引号防止注入
+                wxString safeUrl = mallDialog.m_symbolUrl;
+                safeUrl.Replace("\"", ""); 
+                
+                wxString cmd = wxString::Format("curl -s -L -f --max-time 20 -o \"%s\" \"%s\"", tempFilePath, safeUrl);
+                long curlRes = wxExecute(cmd, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
+
+                if( curlRes != 0 || !wxFileExists(tempFilePath) || wxFileName::GetSize(tempFilePath) == 0 )
+                {
+                    m_frame->ShowInfoBarError( wxString::Format( "❌ 模型下载失败！错误码: %ld", curlRes ) );
+                    continue;
+                }
+
+                // 🌟 致命修复 3：完美接管内存！解决光标变成十字星和导致崩溃的问题
+                std::unique_ptr<LIB_SYMBOL> safeLibSymbol;
+                try 
+                {
+                    std::unique_ptr<SCH_IO> pi( SCH_IO_MGR::FindPlugin( SCH_IO_MGR::SCH_KICAD ) );
+                    if ( pi )
+                    {
+                        wxArrayString aliases;
+                        pi->EnumerateSymbolLib( aliases, tempFilePath );
+                        
+                        if( !aliases.IsEmpty() ) 
+                        {
+                            LIB_SYMBOL* cachedSymbol = pi->LoadSymbol( tempFilePath, aliases[0] );
+                            
+                            if( cachedSymbol )
+                            {
+                                // SCH_IO 解析出来的 cachedSymbol 属于它内部的缓存。
+                                // 在 pi 销毁前，我们赶紧「深拷贝」一份真正属于我们的内存实例 safeLibSymbol！
+                                safeLibSymbol = std::make_unique<LIB_SYMBOL>( *cachedSymbol );
+                                
+                                // 加前缀虚拟库名，防止 ERC 报错
+                                LIB_ID dynamicLibId;
+                                wxString fullId = "LantuBOM:" + safeLibId;
+                                dynamicLibId.Parse( fullId, false );
+                                safeLibSymbol->SetLibId( dynamicLibId );
+                            }
+                        }
+                    }
+                } 
+                catch( ... ) 
+                {
+                    m_frame->ShowInfoBarError( _( "❌ 云端模型解析异常！" ) );
+                    continue;
+                }
+
+                if( !safeLibSymbol )
+                {
+                    m_frame->ShowInfoBarError( _( "❌ 解析成功但模型为空，该文件可能已损坏！" ) );
+                    continue;
+                }
+
+                m_frame->GetInfoBar()->Dismiss(); 
+
+                PICKED_SYMBOL sel;
+                sel.LibId = safeLibSymbol->GetLibId();
                 sel.KeepSymbol = false;
                 sel.PlaceAllUnits = false;
 
                 keepSymbol = sel.KeepSymbol;
                 placeAllUnits = sel.PlaceAllUnits;
+                
+                // 🌟 致命修复 4：设置为 true！放置一次元件后，自动结束工具状态，完美达成商用逻辑，再也不会循环弹窗！
+                placeOneOnly = true; 
 
-                LIB_SYMBOL* libSymbol = sel.LibId.IsValid() ? m_frame->GetLibSymbol( sel.LibId ) : nullptr;
-
-                if( !libSymbol )
-                    continue;
-
-                // If we started with a hotkey which has a position then warp back to that.
-                // Otherwise update to the current mouse position pinned inside the autoscroll
-                // boundaries.
                 if( evt->IsPrime() && !ignorePrimePosition )
                 {
                     cursorPos = grid.Align( evt->Position(), GRID_HELPER_GRIDS::GRID_CONNECTABLE );
@@ -475,62 +510,22 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                                             GRID_HELPER_GRIDS::GRID_CONNECTABLE );
                 }
 
-                EESCHEMA_SETTINGS*    cfg = m_frame->eeconfig();
-
-                // Only convert between power symbol types. Regular (non-power) symbols must
-                // never be promoted to power symbols just because the default is set to
-                // Global or Local. The preference's Default option means "follow the symbol
-                // definition" and any conversion only applies to symbols that are already
-                // power symbols.
-                if( libSymbol->IsPower()
-                    && !libSymbol->IsLocalPower()
-                    && cfg->m_Drawing.new_power_symbols == POWER_SYMBOLS::LOCAL )
-                {
-                    libSymbol->SetLocalPower();
-                    wxString keywords = libSymbol->GetKeyWords();
-
-                    // Adjust the KiCad library default fields to match the new power symbol type
-                    if( keywords.Contains( wxT( "global power" ) ) )
-                    {
-                        keywords.Replace( wxT( "global power" ), wxT( "local power" ) );
-                        libSymbol->SetKeyWords( keywords );
-                    }
-
-                    wxString desc = libSymbol->GetDescription();
-
-                    if( desc.Contains( wxT( "global label" ) ) )
-                    {
-                        desc.Replace( wxT( "global label" ), wxT( "local label" ) );
-                        libSymbol->SetDescription( desc );
-                    }
-                }
-                else if( libSymbol->IsPower()
-                         && !libSymbol->IsGlobalPower()
-                         && cfg->m_Drawing.new_power_symbols == POWER_SYMBOLS::GLOBAL )
-                {
-                    // We do not currently have local power symbols in the KiCad library, so
-                    // don't update any fields
-                    libSymbol->SetGlobalPower();
-                }
-
-                symbol = new SCH_SYMBOL( *libSymbol, &m_frame->GetCurrentSheet(), sel, cursorPos,
-                                         &m_frame->Schematic() );
+                // 直接把深拷贝的对象解引用塞进去，SCH_SYMBOL 内部会完美提取并保存。
+                symbol = new SCH_SYMBOL( *safeLibSymbol, &m_frame->GetCurrentSheet(), sel, cursorPos, &m_frame->Schematic() );
                 addSymbol( symbol );
                 annotate();
 
-                // Update the list of references for the next symbol placement.
                 SCH_REFERENCE placedSymbolReference( symbol, m_frame->GetCurrentSheet() );
                 existingRefs.AddItem( placedSymbolReference );
                 existingRefs.SortByReferenceOnly();
 
                 if( m_frame->eeconfig()->m_AutoplaceFields.enable )
                 {
-                    // Not placed yet, so pass a nullptr screen reference
                     symbol->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
                 }
 
-                // Update cursor now that we have a symbol
                 setCursor();
+                // 此时完全不需要 delete，safeLibSymbol (unique_ptr) 在 if 块结束时会安全地自我销毁，毫无破绽。
             }
             else
             {
@@ -551,9 +546,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
                 commit.Push( _( "Place Symbol" ) );
 
-                // A preselected single-unit symbol exits here rather than re-opening the
-                // chooser.  Multi-unit placement must fall through to the unit continuation
-                // below, which exits once the units are exhausted.
                 if( placeOneOnly && !placeAllUnits )
                     break;
 
@@ -566,11 +558,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
                     if( placeAllUnits )
                     {
-                        // For unannotated references all U?-prefix symbols share the same ref
-                        // string regardless of the library symbol they originate from. Only
-                        // consider units already used by THIS library symbol when stepping
-                        // through units, so different multi-unit parts that share a reference
-                        // prefix do not collide pre-annotation.
                         const wxString currentRefStr = currentReference.GetRef();
                         const bool     isUnannotated = !currentRefStr.IsEmpty() && currentRefStr.Last() == '?';
                         const LIB_ID   symLibId = symbol->GetLibId();
@@ -600,7 +587,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                         }
                     }
 
-                    // We are either stepping to the next unit or next symbol
                     if( keepSymbol || currentReference.GetUnit() > 1 )
                     {
                         nextSymbol = static_cast<SCH_SYMBOL*>( symbol->Duplicate( IGNORE_PARENT_GROUP ) );
@@ -613,7 +599,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                         if( currentReference.GetUnit() == 1 )
                             annotate();
 
-                        // Update the list of references for the next symbol placement.
                         SCH_REFERENCE placedSymbolReference( symbol, m_frame->GetCurrentSheet() );
                         existingRefs.AddItem( placedSymbolReference );
                         existingRefs.SortByReferenceOnly();
@@ -622,17 +607,14 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
                 symbol = nextSymbol;
 
-                // A preselected multi-unit symbol leaves the tool once its last unit is placed.
                 if( placeOneOnly && !symbol )
                     break;
             }
         }
         else if( evt->IsClick( BUT_RIGHT ) )
         {
-            // Warp after context menu only if dragging...
             if( !symbol )
                 m_toolMgr->VetoContextMenuMouseWarp();
-
             m_menu->ShowContextMenu( m_selectionTool->GetSelection() );
         }
         else if( evt->Category() == TC_COMMAND && evt->Action() == TA_CHOICE_MENU_CHOICE )
@@ -641,7 +623,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 && *evt->GetCommandId() <= ID_POPUP_SCH_SELECT_UNIT_END )
             {
                 int unit = *evt->GetCommandId() - ID_POPUP_SCH_SELECT_UNIT;
-
                 if( symbol )
                 {
                     m_frame->SelectUnit( symbol, unit );
@@ -652,7 +633,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                      && *evt->GetCommandId() <= ID_POPUP_SCH_SELECT_BODY_STYLE_END )
             {
                 int bodyStyle = ( *evt->GetCommandId() - ID_POPUP_SCH_SELECT_BODY_STYLE ) + 1;
-
                 if( symbol && symbol->GetBodyStyle() != bodyStyle )
                 {
                     m_frame->SelectBodyStyle( symbol, bodyStyle );
@@ -669,8 +649,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 wxBell();
                 continue;
             }
-
-            // Exit.  The duplicate/repeat/paste will run in its own loop.
             evt->SetPassEvent();
             break;
         }
@@ -678,7 +656,7 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         {
             symbol->SetPosition( cursorPos );
             m_view->ClearPreview();
-            m_view->AddToPreview( symbol, false );   // Add, but not give ownership
+            m_view->AddToPreview( symbol, false );
             m_frame->SetMsgPanel( symbol );
         }
         else if( symbol && evt->IsAction( &ACTIONS::doDelete ) )
@@ -710,7 +688,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
             evt->SetPassEvent();
         }
 
-        // Enable autopanning and cursor capture only when there is a symbol to be placed
         getViewControls()->SetAutoPan( symbol != nullptr );
         getViewControls()->CaptureCursor( symbol != nullptr );
     }
