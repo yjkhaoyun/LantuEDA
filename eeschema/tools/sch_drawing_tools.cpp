@@ -525,13 +525,16 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 PICKED_SYMBOL sel;
                 sel.LibId = safeLibSymbol->GetLibId();
                 sel.KeepSymbol = false;
-                sel.PlaceAllUnits = false;
+                
+                // 🌟 核心修复：动态判断是否为巨型多单元芯片（如 RK3566）
+                // 只有大于1时才开启连放，确保U1A, U1B, U1C能一次性放完，不会缺失引脚！
+                sel.PlaceAllUnits = ( safeLibSymbol->GetUnitCount() > 1 );
 
                 keepSymbol = sel.KeepSymbol;
                 placeAllUnits = sel.PlaceAllUnits;
                 
-                // 🌟 致命修复 4：设置为 true！放置一次元件后，自动结束工具状态，完美达成商用逻辑，再也不会循环弹窗！
-                placeOneOnly = true; 
+                // 🌟 保持 true：放置完该元件（单模块一次放完，多模块全套放完）后，自动安全退出。
+                placeOneOnly = true;
 
                 if( evt->IsPrime() && !ignorePrimePosition )
                 {
