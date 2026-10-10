@@ -49,7 +49,89 @@
 #include <tool/tool_manager.h>
 #include <wx/log.h>
 
+// ======== LantuBOM 新增：安全拉取云端封装 ========
+#include <wx/utils.h>
+#include <wx/filename.h>
+#include <wx/dir.h>
+#include <memory>
+// 🌟 必须使用正确的 pcb_io 目录下的头文件！
+#include <pcb_io/pcb_io_mgr.h>
+#include <pcb_io/pcb_io.h>
+// ===============================================
+
 #include "board_netlist_updater.h"
+
+// =======================================================================
+// 🌟 LantuBOM 云端封装自动拉取
+// =======================================================================
+static bool isSafeToken( const wxString& aStr )
+{
+    if( aStr.IsEmpty() || aStr.Contains( wxS( ".." ) ) )
+        return false;
+    for( wxUniChar c : aStr )
+    {
+        bool ok = ( c >= 'A' && c <= 'Z' ) || ( c >= 'a' && c <= 'z' )
+                  || ( c >= '0' && c <= '9' ) || c == '_' || c == '-' || c == '.';
+        if( !ok )
+            return false;
+    }
+    return true;
+}
+
+static FOOTPRINT* loadLantuBomFootprint( const LIB_ID& aFpid )
+{
+    if( aFpid.GetLibNickname().wx_str() != wxS( "LantuBOM" ) )
+        return nullptr;
+
+    wxString item = aFpid.GetLibItemName().wx_str();
+    int sep = item.Find( '_' );
+    if( sep == wxNOT_FOUND )
+        return nullptr;
+
+    wxString lcscId = item.Mid( 0, sep );
+    wxString fpName = item.Mid( sep + 1 );
+
+    if( !isSafeToken( lcscId ) || !isSafeToken( fpName ) )
+        return nullptr;
+
+    wxString libDir = wxFileName::GetTempDir() + wxFileName::GetPathSeparator() + wxS( "LantuBOM.pretty" );
+    if( !wxDirExists( libDir ) )
+        wxFileName::Mkdir( libDir, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL );
+
+    wxString filePath = libDir + wxFileName::GetPathSeparator() + fpName + wxS( ".kicad_mod" );
+
+    if( !wxFileExists( filePath ) || wxFileName::GetSize( filePath ) == 0 )
+    {
+        wxString url = wxString::Format( wxS( "https://oss.lantubom.com/libs/footprint/%s/%s.kicad_mod" ), lcscId, fpName );
+        wxString cmd = wxString::Format( wxS( "curl -s -L -f --max-time 20 -o \"%s\" \"%s\"" ), filePath, url );
+        long rc = wxExecute( cmd, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE );
+        
+        if( rc != 0 || !wxFileExists( filePath ) || wxFileName::GetSize( filePath ) == 0 )
+        {
+            if (wxFileExists(filePath)) wxRemoveFile( filePath );
+            return nullptr;
+        }
+    }
+
+    try
+    {
+        // 🌟 大厂标准做法：放弃类型推导，明确声明我们正在调用 PCB_IO_MGR 的智能指针
+        std::unique_ptr<PCB_IO> pi( PCB_IO_MGR::FindPlugin( PCB_IO_MGR::KICAD_SEXP ) );
+        if( pi )
+        {
+            //明确要求返回 unique_ptr<FOOTPRINT> 并调用 release 放出裸指针
+            std::unique_ptr<FOOTPRINT> loadedFp = pi->FootprintLoad( libDir, fpName );
+            if( loadedFp )
+            {
+                return loadedFp.release();
+            }
+        }
+    }
+    catch( ... ) {}
+
+    return nullptr;
+}
+// =======================================================================
 
 
 BOARD_NETLIST_UPDATER::BOARD_NETLIST_UPDATER( PCB_EDIT_FRAME* aFrame, BOARD* aBoard ) :
@@ -125,15 +207,9 @@ void BOARD_NETLIST_UPDATER::ApplyChainNetclasses( BOARD* aBoard, const NETLIST& 
     for( const auto& [chain, netclass] : aNetlist.GetNetChainNetClasses() )
         netSettings->SetNetChainNetClass( chain, netclass );
 
-    // Chain membership on the board has just been refreshed from the netlist, so assignments
-    // derived from the previous membership are stale.  The caller's
-    // SynchronizeNetsAndNetClasses() rebuilds them from the maps set above.
     netSettings->ClearChainPatternAssignments( NET_CHAIN_SOURCE::BOARD );
 }
 
-
-// These functions allow inspection of pad nets during dry runs by keeping a cache of
-// current pad netnames indexed by pad.
 
 void BOARD_NETLIST_UPDATER::cacheNetname( PAD* aPad, const wxString& aNetname )
 {
@@ -171,7 +247,6 @@ VECTOR2I BOARD_NETLIST_UPDATER::estimateFootprintInsertionPosition()
 
     if( !m_board->IsEmpty() )
     {
-        // Position new components below any existing board features.
         BOX2I bbox = m_board->GetBoardEdgesBoundingBox();
 
         if( bbox.GetWidth() || bbox.GetHeight() )
@@ -182,7 +257,6 @@ VECTOR2I BOARD_NETLIST_UPDATER::estimateFootprintInsertionPosition()
     }
     else
     {
-        // Position new components in the center of the page when the board is empty.
         VECTOR2I pageSize = m_board->GetPageSettings().GetSizeIU( pcbIUScale.IU_PER_MILS );
 
         bestPosition.x = pageSize.x / 2;
@@ -213,6 +287,14 @@ FOOTPRINT* BOARD_NETLIST_UPDATER::addNewFootprint( COMPONENT* aComponent, const 
     }
 
     FOOTPRINT* footprint = LoadFootprintFromProject( m_board, aFootprintId );
+
+    // 🌟 LantuBOM 拦截点：
+    if( footprint == nullptr )
+        footprint = loadLantuBomFootprint( aFootprintId );
+
+    if( footprint )
+        footprint->SetFPID( aFootprintId );
+    // =======================================================
 
     if( footprint == nullptr )
     {
@@ -247,17 +329,12 @@ FOOTPRINT* BOARD_NETLIST_UPDATER::addNewFootprint( COMPONENT* aComponent, const 
 
             pad->SetLocalRatsnestVisible( showRatsnest );
 
-            // Pads in the library all have orphaned nets.  Replace with Default.
             pad->SetNetCode( 0 );
         }
 
         footprint->SetParent( m_board );
         footprint->SetPosition( estimateFootprintInsertionPosition() );
 
-        // This flag is used to prevent connectivity from considering the footprint during its
-        // initial build after the footprint is committed, because we're going to immediately start
-        // a move operation on the footprint and don't want its pads to drive nets onto vias/tracks
-        // it happens to land on at the initial position.
         footprint->SetAttributes( footprint->GetAttributes() | FP_JUST_ADDED );
 
         m_addedFootprints.push_back( footprint );
@@ -282,7 +359,6 @@ bool BOARD_NETLIST_UPDATER::updateComponentClass( FOOTPRINT* aFootprint, COMPONE
     if( const COMPONENT_CLASS* curClass = aFootprint->GetStaticComponentClass() )
         curClassName = curClass->GetName();
 
-    // Calculate the new component class
     if( m_isDryRun )
     {
         newClassName = COMPONENT_CLASS_MANAGER::GetFullClassNameForConstituents(
@@ -298,7 +374,6 @@ bool BOARD_NETLIST_UPDATER::updateComponentClass( FOOTPRINT* aFootprint, COMPONE
     if( curClassName == newClassName )
         return false;
 
-    // Create a copy for undo if the footprint has not been added during this update
     FOOTPRINT* copy = nullptr;
 
     if( !m_isDryRun && !m_commit.GetStatus( aFootprint ) )
@@ -383,6 +458,14 @@ FOOTPRINT* BOARD_NETLIST_UPDATER::replaceFootprint( NETLIST& aNetlist, FOOTPRINT
 
     FOOTPRINT* newFootprint = LoadFootprintFromProject( m_board, aNewComponent->GetFPID() );
 
+    // 🌟 LantuBOM 拦截点：
+    if( newFootprint == nullptr )
+        newFootprint = loadLantuBomFootprint( aNewComponent->GetFPID() );
+
+    if( newFootprint )
+        newFootprint->SetFPID( aNewComponent->GetFPID() );
+    // =======================================================
+
     if( newFootprint == nullptr )
     {
         msg.Printf( _( "Cannot update %s (footprint '%s' not found)." ),
@@ -433,9 +516,7 @@ FOOTPRINT* BOARD_NETLIST_UPDATER::replaceFootprint( NETLIST& aNetlist, FOOTPRINT
         }
         else
         {
-             // Expand the footprint pad layers
              newFootprint->FixUpPadsForBoard( m_board );
-
              m_board->ExchangeFootprint( aFootprint, newFootprint, m_commit, true );
 
              msg.Printf( _( "Changed %s footprint from '%s' to '%s'."),
@@ -447,7 +528,7 @@ FOOTPRINT* BOARD_NETLIST_UPDATER::replaceFootprint( NETLIST& aNetlist, FOOTPRINT
              return newFootprint;
          }
      }
- }
+}
 
 
 bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, COMPONENT* aNetlistComponent )
@@ -470,7 +551,6 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
         }
     }
 
-    // Create a copy only if the footprint has not been added during this update
     FOOTPRINT* copy = nullptr;
 
     if( !m_commit.GetStatus( aFootprint ) )
@@ -481,7 +561,6 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
 
     bool       changed = false;
 
-    // Test for reference designator field change.
     if( aFootprint->GetReference() != aNetlistComponent->GetReference() )
     {
         if( m_isDryRun )
@@ -503,7 +582,6 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
         m_reporter->Report( msg, RPT_SEVERITY_ACTION );
     }
 
-    // Test for value field change.
     wxString netlistValue = aNetlistComponent->GetValue();
 
     if( firstAssociatedVariant != nullptr
@@ -535,7 +613,6 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
         m_reporter->Report( msg, RPT_SEVERITY_ACTION );
     }
 
-    // Test for time stamp change.
     KIID_PATH new_path = aNetlistComponent->GetPath();
 
     if( !aNetlistComponent->GetKIIDs().empty() )
@@ -568,7 +645,6 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
 
     for( PCB_FIELD* field : aFootprint->GetFields() )
     {
-        // These fields are individually checked above
         if( field->IsReference() || field->IsValue() || field->IsComponentClass() )
         {
             continue;
@@ -577,13 +653,11 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
         fpFieldsAsMap[field->GetName()] = field->GetText();
     }
 
-    // Remove the ref/value/footprint fields that are individually handled
     nlohmann::ordered_map<wxString, wxString> compFields = aNetlistComponent->GetFields();
     compFields.erase( GetDefaultFieldName( FIELD_T::REFERENCE, UNTRANSLATED ) );
     compFields.erase( GetDefaultFieldName( FIELD_T::VALUE, UNTRANSLATED ) );
     compFields.erase( GetDefaultFieldName( FIELD_T::FOOTPRINT, UNTRANSLATED ) );
 
-    // Remove any component class fields - these are not editable in the pcb editor
     compFields.erase( wxT( "Component Class" ) );
 
     if( firstAssociatedVariant != nullptr )
@@ -592,8 +666,6 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
             compFields[name] = value;
     }
 
-    // Fields are stored as an ordered map, but we don't (yet) support reordering the footprint fields to
-    // match the symbol, so we manually check the fields in the order they are stored in the symbol.
     bool same = true;
     bool remove_only = true;
 
@@ -626,7 +698,6 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
                 m_reporter->Report( msg, RPT_SEVERITY_ACTION );
             }
 
-            // Remove fields that aren't present in the symbol
             for( PCB_FIELD* field : aFootprint->GetFields() )
             {
                 if( field->IsMandatory() )
@@ -653,7 +724,6 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
 
                 changed = true;
 
-                // Add or change field value
                 for( auto& [name, value] : compFields )
                 {
                     if( aFootprint->HasField( name ) )
@@ -670,9 +740,7 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
                         newField->SetVisible( false );
                         newField->SetLayer( aFootprint->GetLayer() == F_Cu ? F_Fab : B_Fab );
 
-                        // Give the relative position (0,0) in footprint
                         newField->SetPosition( aFootprint->GetPosition() );
-                        // Give the footprint orientation
                         newField->Rotate( aFootprint->GetPosition(), aFootprint->GetOrientation() );
 
                         newField->StyleFromSettings( m_board->GetDesignSettings(), true );
@@ -997,7 +1065,7 @@ bool BOARD_NETLIST_UPDATER::updateFootprintParameters( FOOTPRINT* aFootprint, CO
 
     if( changed && copy )
         m_commit.Modified( aFootprint, copy );
-    else
+    else if( copy )
         delete copy;
 
     return true;
@@ -1464,6 +1532,7 @@ void BOARD_NETLIST_UPDATER::applyComponentVariants( COMPONENT* aComponent,
                             aComponent->GetReference() );
                 m_reporter->Report( msg, RPT_SEVERITY_ERROR );
                 ++m_errorCount;
+                continue;
             }
             else
             {

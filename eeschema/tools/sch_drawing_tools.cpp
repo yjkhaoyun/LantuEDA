@@ -141,27 +141,32 @@ class DIALOG_LANTU_MALL : public wxDialog
 public:
     wxString m_selectedLibId; 
     wxString m_symbolUrl;     
+    wxString m_fpUrl;         
+    wxString m_fpName;        
 
     DIALOG_LANTU_MALL( wxWindow* parent )
         : wxDialog( parent, wxID_ANY, _("蓝兔智营 - 云端元器件商城"), wxDefaultPosition, wxSize( 1200, 800 ), wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER | wxMAXIMIZE_BOX )
     {
         wxBoxSizer* sizer = new wxBoxSizer( wxVERTICAL );
         
-        // 1. 先加载空页面，确保注入 LantuEdaBridge 后再跳转，防止前端找不到对象
-        m_webView = wxWebView::New( this, wxID_ANY, "about:blank" );
+        // 1. 先加载空页面，确保注入 LantuEdaBridge 后再跳转，防止前端找不到对象 (严格使用 wxS包裹)
+        m_webView = wxWebView::New( this, wxID_ANY, wxS("about:blank") );
         
         if ( m_webView )
         {
             sizer->Add( m_webView, 1, wxEXPAND, 0 );
             
-            m_webView->AddScriptMessageHandler( "LantuEdaBridge" );
+            // 🌟 开启 F12 开发者工具权限，方便排查前端和通信问题
+            m_webView->EnableAccessToDevTools( true ); 
+
+            m_webView->AddScriptMessageHandler( wxS("LantuEdaBridge") );
             Bind( wxEVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, &DIALOG_LANTU_MALL::OnWebMessage, this );
             
             // 拦截新窗口跳转（如数据手册），调用系统默认浏览器打开
             Bind( wxEVT_WEBVIEW_NEWWINDOW, &DIALOG_LANTU_MALL::OnNewWindow, this );
 
             // 跳转到真实地址
-            m_webView->LoadURL( "http://localhost:3000/search?action=select_symbol" );
+            m_webView->LoadURL( wxS("http://localhost:3000/search?action=select_symbol") );
         }
         SetSizer( sizer );
         Center();
@@ -169,14 +174,42 @@ public:
 
     void OnWebMessage( wxWebViewEvent& event )
     {
+        // 过滤掉非自身消息
+        if ( event.GetMessageHandler() != wxS("LantuEdaBridge") && event.GetMessageHandler() != wxS("") )
+        {
+            return; 
+        }
+
         wxString msg = event.GetString();
+        
+        // 兼容某些内核发来带有两端引号的序列化字符串
+        if (msg.StartsWith(wxS("\"")) && msg.EndsWith(wxS("\""))) {
+            msg = msg.Mid(1, msg.Length() - 2);
+            msg.Replace(wxS("\\\""), wxS("\"")); 
+        }
+
         try 
         {
             auto j = nlohmann::json::parse( msg.ToStdString() );
+
+            // 如果被二次序列化成了字符串，优雅地再解析一次
+            if( j.is_string() ) {
+                j = nlohmann::json::parse( j.get<std::string>() );
+            }
+
+            // 兼容 Windows WebView2 包装对象
+            if ( j.contains("type") && j["type"] == "LantuEdaBridge" && j.contains("body") )
+            {
+                j = nlohmann::json::parse( j["body"].get<std::string>() );
+            }
+
             if ( j.contains("action") && j["action"] == "place_symbol" ) 
             {
-                if( j.contains("lib_id") ) m_selectedLibId = wxString::FromUTF8( j["lib_id"].get<std::string>() );
-                if( j.contains("sym_url") ) m_symbolUrl = wxString::FromUTF8( j["sym_url"].get<std::string>() );
+                // 【规范修复】：严格使用 wxString::FromUTF8 解析 std::string 到 wxString，避开隐式转换
+                if( j.contains("lib_id") )  m_selectedLibId = wxString::FromUTF8( j["lib_id"].get<std::string>() );
+                if( j.contains("sym_url") ) m_symbolUrl     = wxString::FromUTF8( j["sym_url"].get<std::string>() );
+                if( j.contains("fp_url") )  m_fpUrl         = wxString::FromUTF8( j["fp_url"].get<std::string>() );
+                if( j.contains("fp_name") ) m_fpName        = wxString::FromUTF8( j["fp_name"].get<std::string>() );
                 
                 EndModal( wxID_OK ); 
             }
@@ -422,25 +455,27 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 m_frame->ShowInfoBarMsg( _( "正在从云端下载模型..." ) );
 
                 wxString safeLibId = mallDialog.m_selectedLibId;
-                safeLibId.Replace("/", "_"); safeLibId.Replace("\\", "_");
+                // 【规范修复】：全量采用 wxS() 安全包裹替换符
+                safeLibId.Replace(wxS("/"), wxS("_")); 
+                safeLibId.Replace(wxS("\\"), wxS("_"));
 
                 wxString tempDir = wxFileName::GetTempDir();
-                wxString tempFilePath = tempDir + wxFileName::GetPathSeparator() + safeLibId + ".kicad_sym";
+                wxString tempFilePath = tempDir + wxFileName::GetPathSeparator() + safeLibId + wxS(".kicad_sym");
                 
                 if (wxFileExists(tempFilePath)) {
                     wxRemoveFile(tempFilePath); 
                 }
 
-// 🌟 致命修复 2：使用纯字符串调用 curl（完美兼容当前 wxWidgets 版本），并剔除引号防止注入
+                // 【规范修复】：剔除引号防止注入，全量使用 wxS
                 wxString safeUrl = mallDialog.m_symbolUrl;
-                safeUrl.Replace("\"", ""); 
+                safeUrl.Replace(wxS("\""), wxS("")); 
                 
-                wxString cmd = wxString::Format("curl -s -L -f --max-time 20 -o \"%s\" \"%s\"", tempFilePath, safeUrl);
+                wxString cmd = wxString::Format(wxS("curl -s -L -f --max-time 20 -o \"%s\" \"%s\""), tempFilePath, safeUrl);
                 long curlRes = wxExecute(cmd, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
 
                 if( curlRes != 0 || !wxFileExists(tempFilePath) || wxFileName::GetSize(tempFilePath) == 0 )
                 {
-                    m_frame->ShowInfoBarError( wxString::Format( "❌ 模型下载失败！错误码: %ld", curlRes ) );
+                    m_frame->ShowInfoBarError( wxString::Format( wxS("❌ 模型下载失败！错误码: %ld"), curlRes ) );
                     continue;
                 }
 
@@ -466,7 +501,7 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                                 
                                 // 加前缀虚拟库名，防止 ERC 报错
                                 LIB_ID dynamicLibId;
-                                wxString fullId = "LantuBOM:" + safeLibId;
+                                wxString fullId = wxS("LantuBOM:") + safeLibId;
                                 dynamicLibId.Parse( fullId, false );
                                 safeLibSymbol->SetLibId( dynamicLibId );
                             }
@@ -512,6 +547,20 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
                 // 直接把深拷贝的对象解引用塞进去，SCH_SYMBOL 内部会完美提取并保存。
                 symbol = new SCH_SYMBOL( *safeLibSymbol, &m_frame->GetCurrentSheet(), sel, cursorPos, &m_frame->Schematic() );
+
+                // 🌟 LantuBOM 核心逻辑：强行改写封装字段，使用 "_" 替代 "|" 防止被系统过滤
+                if ( !mallDialog.m_fpName.IsEmpty() )
+                {
+                    // 【大厂规范】：全量包裹 wxS，避免与 C 窄字符相加导致隐式构造报错（C2248）
+                    wxString newFpName = wxS("LantuBOM:") + mallDialog.m_selectedLibId + wxS("_") + mallDialog.m_fpName;
+                    
+                    // 【规范修改】：使用官方枚举 FIELD_T::FOOTPRINT 代替魔术数字 2
+                    if ( SCH_FIELD* fpField = symbol->GetField( FIELD_T::FOOTPRINT ) )
+                    {
+                        fpField->SetText( newFpName );
+                    }
+                }
+
                 addSymbol( symbol );
                 annotate();
 
@@ -2478,7 +2527,7 @@ int SCH_DRAWING_TOOLS::DrawRuleArea( const TOOL_EVENT& aEvent )
         controls->ForceCursorPosition( true, cursorPos );
 
         polyGeomMgr.SetLeaderMode( m_frame->eeconfig()->m_Drawing.line_mode == LINE_MODE_FREE ? LEADER_MODE::DIRECT
-                                                                                              : LEADER_MODE::DEG45 );
+                                                                                                : LEADER_MODE::DEG45 );
 
         if( evt->IsCancelInteractive() )
         {
