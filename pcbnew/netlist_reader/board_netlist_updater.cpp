@@ -98,31 +98,57 @@ static FOOTPRINT* loadLantuBomFootprint( const LIB_ID& aFpid )
     if( !wxDirExists( libDir ) )
         wxFileName::Mkdir( libDir, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL );
 
-    wxString filePath = libDir + wxFileName::GetPathSeparator() + fpName + wxS( ".kicad_mod" );
+    // 🌟 核心修复：把变量声明在最外层，确保下面的 try 块也能访问到！
+    wxString modFilePath = libDir + wxFileName::GetPathSeparator() + fpName + wxS( ".kicad_mod" );
+    wxString stepFilePath = libDir + wxFileName::GetPathSeparator() + fpName + wxS( ".step" );
 
-    if( !wxFileExists( filePath ) || wxFileName::GetSize( filePath ) == 0 )
+    // 1. 下载 .kicad_mod 文件 (2D封装)
+    if( !wxFileExists( modFilePath ) || wxFileName::GetSize( modFilePath ) == 0 )
     {
         wxString url = wxString::Format( wxS( "https://oss.lantubom.com/libs/footprint/%s/%s.kicad_mod" ), lcscId, fpName );
-        wxString cmd = wxString::Format( wxS( "curl -s -L -f --max-time 20 -o \"%s\" \"%s\"" ), filePath, url );
+        wxString cmd = wxString::Format( wxS( "curl -s -L -f --max-time 20 -o \"%s\" \"%s\"" ), modFilePath, url );
         long rc = wxExecute( cmd, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE );
         
-        if( rc != 0 || !wxFileExists( filePath ) || wxFileName::GetSize( filePath ) == 0 )
+        if( rc != 0 || !wxFileExists( modFilePath ) || wxFileName::GetSize( modFilePath ) == 0 )
         {
-            if (wxFileExists(filePath)) wxRemoveFile( filePath );
+            if (wxFileExists(modFilePath)) wxRemoveFile( modFilePath );
             return nullptr;
         }
     }
 
+    // 2. 下载 .step 文件 (3D模型)
+    if( !wxFileExists( stepFilePath ) || wxFileName::GetSize( stepFilePath ) == 0 )
+    {
+        wxString stepUrl = wxString::Format( wxS( "https://oss.lantubom.com/libs/3d/%s/%s.step" ), lcscId, fpName );
+        wxString stepCmd = wxString::Format( wxS( "curl -s -L -f --max-time 20 -o \"%s\" \"%s\"" ), stepFilePath, stepUrl );
+        long stepRc = wxExecute( stepCmd, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE );
+        
+        if( stepRc != 0 || !wxFileExists( stepFilePath ) || wxFileName::GetSize( stepFilePath ) == 0 )
+        {
+            if (wxFileExists(stepFilePath)) wxRemoveFile( stepFilePath );
+            // 3D模型下载失败不阻断 2D 封装加载，只是在 3D 视图里看不见而已
+        }
+    }
+
+    // 3. 加载到内存并替换路径
     try
     {
-        // 🌟 大厂标准做法：放弃类型推导，明确声明我们正在调用 PCB_IO_MGR 的智能指针
         std::unique_ptr<PCB_IO> pi( PCB_IO_MGR::FindPlugin( PCB_IO_MGR::KICAD_SEXP ) );
         if( pi )
         {
-            //明确要求返回 unique_ptr<FOOTPRINT> 并调用 release 放出裸指针
             std::unique_ptr<FOOTPRINT> loadedFp = pi->FootprintLoad( libDir, fpName );
             if( loadedFp )
             {
+                // 拦截并改写 3D 模型的本地路径
+                if( wxFileExists( stepFilePath ) )
+                {
+                    // 必须使用 auto& 真实引用修改模型路径
+                    for( auto& model : loadedFp->Models() )
+                    {
+                        model.m_Filename = stepFilePath;
+                    }
+                }
+                
                 return loadedFp.release();
             }
         }
