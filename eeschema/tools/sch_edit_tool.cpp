@@ -997,14 +997,19 @@ bool SCH_EDIT_TOOL::Init()
                     if( !m_frame || !m_frame->GetScreen() || !m_frame->GetCanvas() || !getView() || !m_selectionTool )
                         return;
 
+                    SCH_SCREEN*           screen    = m_frame->GetScreen();
+                    const SCH_SHEET_PATH& sheetPath = m_frame->GetCurrentSheet();
+
                     VECTOR2D worldPosD = getView()->ToWorld( VECTOR2D( aEvt.GetX(), aEvt.GetY() ) );
                     VECTOR2I worldPos( KiROUND( worldPosD.x ), KiROUND( worldPosD.y ) );
+                    const int hitRadius = schIUScale.MilsToIU( 25 );
 
-                    SCH_PIN*              hoveredPin = nullptr;
-                    const SCH_SHEET_PATH& sheetPath  = m_frame->GetCurrentSheet();
-                    const int             hitRadius  = schIUScale.MilsToIU( 25 );
+                    std::set<SCH_PIN*>        targetPins;
+                    std::set<SCH_LINE*>       targetWires;
+                    std::set<SCH_LABEL_BASE*> targetLabels;
 
-                    for( EDA_ITEM* symItem : m_frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+                    // 1. 检测鼠标是否悬停在某个引脚 (SCH_PIN) 上
+                    for( EDA_ITEM* symItem : screen->Items().OfType( SCH_SYMBOL_T ) )
                     {
                         SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
 
@@ -1012,24 +1017,169 @@ bool SCH_EDIT_TOOL::Init()
                         {
                             if( pin->HitTest( worldPos, hitRadius ) || pin->GetBoundingBox().Contains( worldPos ) )
                             {
-                                hoveredPin = pin;
+                                targetPins.insert( pin );
                                 break;
                             }
                         }
 
-                        if( hoveredPin )
+                        if( !targetPins.empty() )
                             break;
+                    }
+
+                    // 2. 检测鼠标是否悬停在某个网络标签 (SCH_LABEL / GLOBAL / HIER) 上
+                    if( targetPins.empty() )
+                    {
+                        for( EDA_ITEM* item : screen->Items() )
+                        {
+                            if( item->Type() != SCH_LABEL_T && item->Type() != SCH_GLOBAL_LABEL_T
+                                && item->Type() != SCH_HIER_LABEL_T )
+                            {
+                                continue;
+                            }
+
+                            SCH_LABEL_BASE* lbl = static_cast<SCH_LABEL_BASE*>( item );
+
+                            if( lbl->HitTest( worldPos, hitRadius ) || lbl->GetBoundingBox().Contains( worldPos ) )
+                            {
+                                targetLabels.insert( lbl );
+                                break;
+                            }
+                        }
+                    }
+
+                    // 3. 检测鼠标是否悬停在某根延长导线 (SCH_LINE) 上
+                    if( targetPins.empty() && targetLabels.empty() )
+                    {
+                        for( EDA_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+                        {
+                            SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+                            if( wire->IsWire() && wire->HitTest( worldPos, hitRadius ) )
+                            {
+                                targetWires.insert( wire );
+                                break;
+                            }
+                        }
+                    }
+
+                    // 4. 如果命中了引脚或标签，顺藤摸瓜找到直接相连的延长导线
+                    if( !targetPins.empty() || !targetLabels.empty() )
+                    {
+                        for( EDA_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+                        {
+                            SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+                            if( !wire->IsWire() )
+                                continue;
+
+                            for( SCH_PIN* pin : targetPins )
+                            {
+                                if( IsPointOnSegment( wire->GetStartPoint(), wire->GetEndPoint(), pin->GetPosition() ) )
+                                    targetWires.insert( wire );
+                            }
+
+                            for( SCH_LABEL_BASE* lbl : targetLabels )
+                            {
+                                if( IsPointOnSegment( wire->GetStartPoint(), wire->GetEndPoint(), lbl->GetPosition() ) )
+                                    targetWires.insert( wire );
+                            }
+                        }
+                    }
+
+                    // 5. 递归扩展所有相连的折线线段（支持多段拐弯延长线）
+                    bool addedWire = !targetWires.empty();
+
+                    while( addedWire )
+                    {
+                        addedWire = false;
+
+                        for( EDA_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+                        {
+                            SCH_LINE* cand = static_cast<SCH_LINE*>( item );
+
+                            if( !cand->IsWire() || targetWires.count( cand ) )
+                                continue;
+
+                            for( SCH_LINE* w : targetWires )
+                            {
+                                if( IsPointOnSegment( w->GetStartPoint(), w->GetEndPoint(), cand->GetStartPoint() )
+                                    || IsPointOnSegment( w->GetStartPoint(), w->GetEndPoint(), cand->GetEndPoint() )
+                                    || IsPointOnSegment( cand->GetStartPoint(), cand->GetEndPoint(), w->GetStartPoint() )
+                                    || IsPointOnSegment( cand->GetStartPoint(), cand->GetEndPoint(), w->GetEndPoint() ) )
+                                {
+                                    targetWires.insert( cand );
+                                    addedWire = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 6. 通过延长导线反查所有关联的引脚与网络标签，实现“引脚+线+标签”三位一体
+                    if( !targetWires.empty() )
+                    {
+                        for( EDA_ITEM* symItem : screen->Items().OfType( SCH_SYMBOL_T ) )
+                        {
+                            SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+
+                            for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
+                            {
+                                for( SCH_LINE* w : targetWires )
+                                {
+                                    if( IsPointOnSegment( w->GetStartPoint(), w->GetEndPoint(), pin->GetPosition() ) )
+                                    {
+                                        targetPins.insert( pin );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        for( EDA_ITEM* item : screen->Items() )
+                        {
+                            if( item->Type() != SCH_LABEL_T && item->Type() != SCH_GLOBAL_LABEL_T
+                                && item->Type() != SCH_HIER_LABEL_T )
+                            {
+                                continue;
+                            }
+
+                            SCH_LABEL_BASE* lbl = static_cast<SCH_LABEL_BASE*>( item );
+
+                            for( SCH_LINE* w : targetWires )
+                            {
+                                if( IsPointOnSegment( w->GetStartPoint(), w->GetEndPoint(), lbl->GetPosition() ) )
+                                {
+                                    targetLabels.insert( lbl );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 7. 兼容没有延长线、标签直接贴在引脚末端的情况
+                    for( SCH_PIN* pin : targetPins )
+                    {
+                        for( EDA_ITEM* item : screen->Items() )
+                        {
+                            if( item->Type() == SCH_LABEL_T || item->Type() == SCH_GLOBAL_LABEL_T
+                                || item->Type() == SCH_HIER_LABEL_T )
+                            {
+                                if( item->GetPosition() == pin->GetPosition() )
+                                    targetLabels.insert( static_cast<SCH_LABEL_BASE*>( item ) );
+                            }
+                        }
                     }
 
                     bool changed = false;
 
-                    for( EDA_ITEM* symItem : m_frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+                    // 8. 同步更新所有引脚的高亮状态
+                    for( EDA_ITEM* symItem : screen->Items().OfType( SCH_SYMBOL_T ) )
                     {
                         SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
 
                         for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
                         {
-                            if( pin == hoveredPin )
+                            if( targetPins.count( pin ) )
                             {
                                 if( !pin->IsBrightened() )
                                 {
@@ -1044,6 +1194,42 @@ bool SCH_EDIT_TOOL::Init()
                                 getView()->Update( sym, KIGFX::APPEARANCE );
                                 changed = true;
                             }
+                        }
+                    }
+
+                    // 9. 同步更新所有延长导线与网络标签的高亮状态
+                    for( EDA_ITEM* item : screen->Items() )
+                    {
+                        bool shouldBrighten = false;
+
+                        if( item->Type() == SCH_LINE_T )
+                        {
+                            shouldBrighten = targetWires.count( static_cast<SCH_LINE*>( item ) ) > 0;
+                        }
+                        else if( item->Type() == SCH_LABEL_T || item->Type() == SCH_GLOBAL_LABEL_T
+                                 || item->Type() == SCH_HIER_LABEL_T )
+                        {
+                            shouldBrighten = targetLabels.count( static_cast<SCH_LABEL_BASE*>( item ) ) > 0;
+                        }
+                        else
+                        {
+                            continue;
+                        }
+
+                        if( shouldBrighten )
+                        {
+                            if( !item->IsBrightened() )
+                            {
+                                m_selectionTool->BrightenItem( item );
+                                getView()->Update( item, KIGFX::APPEARANCE );
+                                changed = true;
+                            }
+                        }
+                        else if( item->IsBrightened() )
+                        {
+                            m_selectionTool->UnbrightenItem( item );
+                            getView()->Update( item, KIGFX::APPEARANCE );
+                            changed = true;
                         }
                     }
 
@@ -3243,6 +3429,7 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
     aFrame->Schematic().CleanUp( &commit );
     aFrame->TestDanglingEnds();
     aFrame->OnModify();
+    aToolMgr->RunAction( ACTIONS::selectionClear ); // 🌟 新增：清除双击时留下的淡蓝色选中框
     aFrame->GetCanvas()->Refresh();
 
     commit.Push( isNewLabel ? _( "Add Pin Net Label" ) : _( "Edit Pin Net Label" ) );

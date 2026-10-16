@@ -196,7 +196,7 @@ enum VIA_ACTION_FLAGS
 static const TOOL_ACTION ACT_PlaceThroughVia( TOOL_ACTION_ARGS()
         .Name( "pcbnew.InteractiveRouter.PlaceVia" )
         .Scope( AS_CONTEXT )
-        .DefaultHotkey( 'V' )
+        .DefaultHotkey( MD_ALT + 'V' ) // 🌟 蓝兔智营修改：布线中按 Alt+V 打过孔
         .LegacyHotkeyName( "Add Through Via" )
         .FriendlyName( _( "Place Through Via" ) )
         .Tooltip( _( "Adds a through-hole via at the end of currently routed track." ) )
@@ -320,7 +320,7 @@ static const TOOL_ACTION ACT_SwitchCornerModeArc45( TOOL_ACTION_ARGS()
 static const TOOL_ACTION ACT_SwitchCornerModeArc90( TOOL_ACTION_ARGS()
         .Name( "pcbnew.InteractiveRouter.SwitchRoundingArc90" )
         .Scope( AS_CONTEXT )
-        .DefaultHotkey( MD_ALT + 'W' )
+        .DefaultHotkey( MD_CTRL + MD_ALT + '9' )
         .FriendlyName( _( "Track Corner Mode Arc 90" ) )
         .Tooltip( _( "Switch to arc 90° corner when routing tracks." ) ) );
 
@@ -1351,16 +1351,12 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
     if( !IsToolActive() )
         return 0;
 
-    // Ensure PNS_KICAD_IFACE (m_iface) m_board member is up to date
-    // For some reason, this is not always the case
     m_iface->SetBoard( board() );
 
-    // First see if this is one of the switch layer commands
     BOARD*       brd           = board();
     LSET         enabledLayers = LSET::AllCuMask( brd->GetDesignSettings().GetCopperLayerCount() );
     LSEQ         layers        = enabledLayers.UIOrder();
 
-    // These layers are in Board Layer UI order not PNS layer order
     PCB_LAYER_ID currentLayer = m_iface->GetBoardLayerFromPNSLayer( m_router->GetCurrentLayer() );
     PCB_LAYER_ID targetLayer  = UNDEFINED_LAYER;
 
@@ -1379,8 +1375,7 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
         }
 
         target_idx = ( idx + 1 ) % layers.size();
-        // issue: #14480
-        // idx + 1 layer may be invisible, switches to next visible layer
+
         for( size_t i = 0; i < layers.size() - 1; i++ )
         {
             if( brd->IsLayerVisible( layers[target_idx] ) )
@@ -1391,16 +1386,11 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
             target_idx += 1;
 
             if( target_idx >= layers.size() )
-            {
                 target_idx = 0;
-            }
         }
 
         if( targetLayer == UNDEFINED_LAYER )
-        {
-            // if there is no visible layers
             return 0;
-        }
     }
     else if( aEvent.IsAction( &PCB_ACTIONS::layerPrev ) )
     {
@@ -1433,10 +1423,7 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
         }
 
         if( targetLayer == UNDEFINED_LAYER )
-        {
-            // if there is no visible layers
             return 0;
-        }
     }
     else if( aEvent.IsAction( &PCB_ACTIONS::layerToggle ) )
     {
@@ -1451,8 +1438,43 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
     {
         targetLayer = aEvent.Parameter<PCB_LAYER_ID>();
 
+        // 🌟 智能兼容：如果在双面板（没有开启 In1.Cu）下按了 2 键 (In1_Cu)，自动切到底层 B.Cu
         if( !enabledLayers.test( targetLayer ) )
-            return 0;
+        {
+            if( targetLayer == In1_Cu && layers.size() == 2 )
+                targetLayer = B_Cu;
+            else
+                return 0;
+        }
+    }
+
+    // 🌟 如果尚未点击起点（处于按了 Alt+W 后的准备状态），直接切换当前活动层
+    if( !m_router->RoutingInProgress() )
+    {
+        if( targetLayer == UNDEFINED_LAYER )
+        {
+            PCB_SCREEN* screen = frame()->GetScreen();
+            targetLayer = ( frame()->GetActiveLayer() == screen->m_Route_Layer_TOP )
+                                  ? screen->m_Route_Layer_BOTTOM
+                                  : screen->m_Route_Layer_TOP;
+        }
+
+        if( targetLayer != UNDEFINED_LAYER && enabledLayers.test( targetLayer ) )
+        {
+            PCB_EDIT_FRAME* editFrame = getEditFrame<PCB_EDIT_FRAME>();
+            editFrame->SetActiveLayer( targetLayer );
+
+            if( !getView()->IsLayerVisible( targetLayer ) )
+            {
+                editFrame->GetAppearancePanel()->SetLayerVisible( targetLayer, true );
+                editFrame->GetCanvas()->Refresh();
+            }
+
+            m_router->SwitchLayer( m_iface->GetPNSLayerFromBoardLayer( targetLayer ) );
+            updateStartItem( aEvent );
+        }
+
+        return 0;
     }
 
     if( targetLayer != UNDEFINED_LAYER )
@@ -1460,11 +1482,14 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
         if( targetLayer == currentLayer )
             return 0;
 
-        if( !aForceVia && m_router && m_router->SwitchLayer( m_iface->GetPNSLayerFromBoardLayer( targetLayer ) ) )
+        if( !aForceVia && m_endSnapPoint == m_startSnapPoint
+            && m_router && m_router->SwitchLayer( m_iface->GetPNSLayerFromBoardLayer( targetLayer ) ) )
         {
+            PCB_EDIT_FRAME* editFrame = getEditFrame<PCB_EDIT_FRAME>();
+            editFrame->SetActiveLayer( targetLayer );
             updateEndItem( aEvent );
             updateSizesAfterRouterEvent( m_iface->GetPNSLayerFromBoardLayer( targetLayer ), m_endSnapPoint );
-            m_router->Move( m_endSnapPoint, m_endItem );        // refresh
+            m_router->Move( m_endSnapPoint, m_endItem );
             return 0;
         }
     }
@@ -1479,27 +1504,31 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
     VIATYPE viaType     = VIATYPE::THROUGH;
     bool    selectLayer = false;
 
-    // Otherwise it is one of the router-specific via commands
     if( targetLayer == UNDEFINED_LAYER )
     {
-        const int actViaFlags = aEvent.Parameter<int>();
-        selectLayer           = actViaFlags & VIA_ACTION_FLAGS::SELECT_LAYER;
+        int actViaFlags = VIA_ACTION_FLAGS::VIA;
 
-        viaType = getViaTypeFromFlags( actViaFlags );
+        if( aEvent.IsAction( &ACT_PlaceThroughVia )
+            || aEvent.IsAction( &ACT_PlaceBlindVia )
+            || aEvent.IsAction( &ACT_PlaceMicroVia )
+            || aEvent.IsAction( &ACT_SelLayerAndPlaceThroughVia )
+            || aEvent.IsAction( &ACT_SelLayerAndPlaceBlindVia )
+            || aEvent.IsAction( &ACT_SelLayerAndPlaceMicroVia ) )
+        {
+            actViaFlags = aEvent.Parameter<int>();
+        }
 
-        // ask the user for a target layer
+        selectLayer = actViaFlags & VIA_ACTION_FLAGS::SELECT_LAYER;
+        viaType     = getViaTypeFromFlags( actViaFlags );
+
         if( selectLayer )
         {
-            // When the currentLayer is undefined, trying to place a via does not work
-            // because it means there is no track in progress, and some other variables
-            // values are not defined like m_endSnapPoint. So do not continue.
             if( currentLayer == UNDEFINED_LAYER )
                 return 0;
 
             wxPoint endPoint = ToWxPoint( view()->ToScreen( m_endSnapPoint ) );
             endPoint = frame()->GetCanvas()->ClientToScreen( endPoint );
 
-            // Build the list of not allowed layer for the target layer
             LSET not_allowed_ly = LSET::AllNonCuMask();
 
             if( viaType != VIATYPE::THROUGH )
@@ -1508,25 +1537,18 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
             targetLayer = frame()->SelectOneLayer( static_cast<PCB_LAYER_ID>( currentLayer ),
                                                    not_allowed_ly, endPoint );
 
-            // Reset the cursor to the end of the track
             controls()->SetCursorPosition( m_endSnapPoint );
 
-            if( targetLayer == UNDEFINED_LAYER )    // canceled by user
+            if( targetLayer == UNDEFINED_LAYER )
                 return 0;
 
-            // One cannot place a blind/buried via on only one layer:
-            if( viaType != VIATYPE::THROUGH )
-            {
-                if( currentLayer == targetLayer )
-                    return 0;
-            }
+            if( viaType != VIATYPE::THROUGH && currentLayer == targetLayer )
+                return 0;
         }
     }
 
-    // fixme: P&S supports more than one fixed layer pair. Update the dialog?
     sizes.ClearLayerPairs();
 
-    // Convert blind/buried via to a through hole one, if it goes through all layers
     if( viaType != VIATYPE::THROUGH
             && ( ( targetLayer == B_Cu && currentLayer == F_Cu )
                        || ( targetLayer == F_Cu && currentLayer == B_Cu ) ) )
@@ -1534,88 +1556,16 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
         viaType = VIATYPE::THROUGH;
     }
 
+    // 🌟 嘉立创风格：布线中按 Alt+V 时，若当前不在底层则切到底层(B.Cu)，若已在底层则切回顶层(F.Cu)
     if( targetLayer == UNDEFINED_LAYER )
     {
-        // Implicit layer selection
-        if( viaType == VIATYPE::THROUGH )
-        {
-            // Try to switch to the nearest ratnest item's layer if we have one
-            VECTOR2I        otherEnd;
-            PNS_LAYER_RANGE otherEndLayers;
-            PNS::ITEM*      otherEndItem = nullptr;
-
-            if( !m_router->GetNearestRatnestAnchor( otherEnd, otherEndLayers, otherEndItem ) )
-            {
-                // use the default layer pair
-                currentLayer = pairTop;
-                targetLayer = pairBottom;
-            }
-            else
-            {
-                // use the layer of the other end, unless it is the same layer as the currently active layer, in which
-                // case use the layer pair (if applicable)
-                PCB_LAYER_ID otherEndLayerPcbId = m_iface->GetBoardLayerFromPNSLayer( otherEndLayers.Start() );
-                const std::optional<int> pairedLayerPns = m_router->Sizes().PairedLayer( m_router->GetCurrentLayer() );
-
-                const PNS_LAYER_RANGE allCopperLayers( m_iface->GetPNSLayerFromBoardLayer( F_Cu ),
-                                                       m_iface->GetPNSLayerFromBoardLayer( B_Cu ) );
-
-                // A through anchor connects on every copper layer, so it names no single target.
-                // Test the hole rather than the copper range, which segmented padstacks
-                // (FRONT_INNER_BACK, custom) can report as a single layer.
-                const bool otherEndIsThrough =
-                        otherEndLayers == allCopperLayers
-                        || ( otherEndItem && otherEndItem->HasHole()
-                             && otherEndItem->Hole()->Layers() == allCopperLayers );
-
-                if( otherEndIsThrough )
-                {
-                    // Honour the user's layer pair; the anchor span start is always the top
-                    // copper layer and would ignore it. Constrained anchors fall through below.
-                    if( currentLayer == pairBottom )
-                        targetLayer = pairTop;
-                    else if( currentLayer == pairTop )
-                        targetLayer = pairBottom;
-                    else
-                        targetLayer = pairTop;
-                }
-                else if( currentLayer == otherEndLayerPcbId && pairedLayerPns.has_value() )
-                {
-                    // Closest ratsnest layer is the same as the active layer - assume the via is being placed for
-                    // other routing reasons and switch the layer
-                    targetLayer = m_iface->GetBoardLayerFromPNSLayer( *pairedLayerPns );
-                }
-                else
-                {
-                    targetLayer = m_iface->GetBoardLayerFromPNSLayer( otherEndLayers.Start() );
-                }
-            }
-        }
+        if( currentLayer == pairBottom )
+            targetLayer = pairTop;
         else
-        {
-            if( currentLayer == pairTop || currentLayer == pairBottom )
-            {
-                // the current layer is on the defined layer pair,
-                // swap to the other side
-                currentLayer = pairTop;
-                targetLayer = pairBottom;
-            }
-            else
-            {
-                // the current layer is not part of the current layer pair,
-                // so fallback and swap to the top layer of the pair by default
-                targetLayer = pairTop;
-            }
+            targetLayer = pairBottom;
 
-            // Do not create a broken via (i.e. a via on only one copper layer)
-            if( currentLayer == targetLayer )
-            {
-                WX_INFOBAR* infobar = frame()->GetInfoBar();
-                infobar->ShowMessageFor( _( "Via needs 2 different layers." ), 5000, wxICON_ERROR,
-                                         WX_INFOBAR::MESSAGE_TYPE::DRC_VIOLATION );
-                return 0;
-            }
-        }
+        if( currentLayer == targetLayer )
+            targetLayer = ( currentLayer == F_Cu ) ? B_Cu : F_Cu;
     }
 
     sizes.SetViaDiameter( bds.m_ViasMinSize );
@@ -1662,7 +1612,34 @@ int ROUTER_TOOL::handleLayerSwitch( const TOOL_EVENT& aEvent, bool aForceVia )
     if( m_router->RoutingInProgress() )
     {
         updateEndItem( aEvent );
-        m_router->Move( m_endSnapPoint, m_endItem );
+        m_router->Move( m_endSnapPoint, nullptr );
+
+        // 🌟 蓝兔智营核心修改：立即在当前鼠标停留位置挖孔固定过孔，
+        // 自动切换到目标层（如底层 B.Cu），并且不断开布线，鼠标继续拉着新层的线！
+        if( !m_router->FixRoute( m_endSnapPoint, nullptr, false, false ) )
+        {
+            if( !m_router->IsPlacingVia() )
+            {
+                int targetPnsLayer = m_iface->GetPNSLayerFromBoardLayer( targetLayer );
+                m_router->SwitchLayer( targetPnsLayer );
+                m_lastTargetLayer = targetLayer;
+
+                PCB_EDIT_FRAME* editFrame = getEditFrame<PCB_EDIT_FRAME>();
+                editFrame->SetActiveLayer( targetLayer );
+
+                if( !getView()->IsLayerVisible( targetLayer ) )
+                {
+                    editFrame->GetAppearancePanel()->SetLayerVisible( targetLayer, true );
+                    editFrame->GetCanvas()->Refresh();
+                }
+
+                updateSizesAfterRouterEvent( targetPnsLayer, m_endSnapPoint );
+                updateEndItem( aEvent );
+                m_router->Move( m_endSnapPoint, m_endItem );
+                m_startItem = nullptr;
+                UpdateMessagePanel();
+            }
+        }
     }
     else
     {
@@ -1820,29 +1797,28 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
                 }
             };
 
-    // Set initial cursor
     setCursor();
 
-    // If the user pressed 'V' before starting to route, enable via placement now
+    // 🌟 新增：记录是否已经左键固定过拐点/过孔，以及最后一次固定的精确坐标
+    bool     hasFixedPoints = false;
+    VECTOR2I lastFixedPoint = m_startSnapPoint;
+
     if( m_startWithVia )
     {
         m_startWithVia = false;
         handleLayerSwitch( ACT_PlaceThroughVia.MakeEvent(), true );
+        hasFixedPoints = true;
+        lastFixedPoint = m_endSnapPoint;
     }
 
-    // Throttle wxEVT_UPDATE_UI during routing. The idle sweep fires between every Wait()
-    // iteration and its cost dominates at interactive frame rates.
     UI_UPDATE_INTERVAL_GUARD uiGuard( 200 );
 
     while( TOOL_EVENT* evt = Wait() )
     {
-        // Snapping uses ViewGetLOD(), which uses the layerVisibilityCache.  Catch any visibility
-        // changes while routing.
         m_toolMgr->GetView()->SyncLayerVisibilityCache();
 
         setCursor();
 
-        // Don't crash if we missed an operation that canceled routing.
         if( !m_router->RoutingInProgress() )
         {
             if( evt->IsCancelInteractive() )
@@ -1858,14 +1834,64 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
             updateEndItem( *evt );
             m_router->Move( m_endSnapPoint, m_endItem );
         }
+        // 布线过程中按 Alt+V 或 V，立即在鼠标停留处挖孔切到底层，并记录固定点坐标
+        else if( evt->IsAction( &ACT_PlaceThroughVia )
+                 || evt->IsAction( &PCB_ACTIONS::layerToggle )
+                 || evt->IsAction( &PCB_ACTIONS::drawVia )
+                 || ( evt->IsKeyPressed() && ( evt->KeyCode() == 'V' || evt->KeyCode() == 'v' ) ) )
+        {
+            evt->SetPassEvent( false );
+            handleLayerSwitch( ACT_PlaceThroughVia.MakeEvent(), true );
+            hasFixedPoints = true;
+            lastFixedPoint = m_endSnapPoint;
+        }
+        // 布线过程中按数字键 1=F.Cu, 2=In1.Cu, 3=In2.Cu... 0=B.Cu 立即打孔切层，并记录固定点坐标
+        else if( evt->IsActionInGroup( PCB_ACTIONS::layerDirectSwitchActions() )
+                 || evt->IsAction( &PCB_ACTIONS::layerNext )
+                 || evt->IsAction( &PCB_ACTIONS::layerPrev ) )
+        {
+            evt->SetPassEvent( false );
+            handleLayerSwitch( *evt, true );
+            hasFixedPoints = true;
+            lastFixedPoint = m_endSnapPoint;
+        }
+        else if( evt->IsKeyPressed() && !evt->Modifier() && evt->KeyCode() >= '0' && evt->KeyCode() <= '9' )
+        {
+            evt->SetPassEvent( false );
+            const TOOL_ACTION* layerAct = nullptr;
+
+            switch( evt->KeyCode() )
+            {
+            case '1': layerAct = &PCB_ACTIONS::layerTop;    break;
+            case '2': layerAct = &PCB_ACTIONS::layerInner1; break;
+            case '3': layerAct = &PCB_ACTIONS::layerInner2; break;
+            case '4': layerAct = &PCB_ACTIONS::layerInner3; break;
+            case '5': layerAct = &PCB_ACTIONS::layerInner4; break;
+            case '6': layerAct = &PCB_ACTIONS::layerInner5; break;
+            case '7': layerAct = &PCB_ACTIONS::layerInner6; break;
+            case '8': layerAct = &PCB_ACTIONS::layerInner7; break;
+            case '9': layerAct = &PCB_ACTIONS::layerInner8; break;
+            case '0': layerAct = &PCB_ACTIONS::layerBottom; break;
+            default: break;
+            }
+
+            if( layerAct )
+            {
+                handleLayerSwitch( layerAct->MakeEvent(), true );
+                hasFixedPoints = true;
+                lastFixedPoint = m_endSnapPoint;
+            }
+        }
         else if( evt->IsAction( &PCB_ACTIONS::routerUndoLastSegment )
-                    || evt->IsAction( &ACTIONS::doDelete )
-                    || evt->IsAction( &ACTIONS::undo ) )
+                     || evt->IsAction( &ACTIONS::doDelete )
+                     || evt->IsAction( &ACTIONS::undo ) )
         {
             if( std::optional<VECTOR2I> last = m_router->UndoLastSegment() )
             {
                 getViewControls()->WarpMouseCursor( last.value(), true );
                 evt->SetMousePosition( last.value() );
+                lastFixedPoint = last.value();
+                hasFixedPoints = m_router->Placer() && m_router->Placer()->HasPlacedAnything();
             }
 
             updateEndItem( *evt );
@@ -1880,9 +1906,6 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
 
             if( m_router->Finish() )
             {
-                // When we're routing a group of signals automatically we want
-                // to break up the undo stack every time we have to manually route
-                // so the user gets nice checkpoints. Remove the APPEND_UNDO flag.
                 if( autoRouted != nullptr )
                     *autoRouted = true;
 
@@ -1890,15 +1913,12 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
             }
             else
             {
-                // This acts as check if we were called by the autorouter; we don't want
-                // to reset APPEND_UNDO if we're auto finishing after route-other-end
                 if( autoRouted != nullptr )
                 {
                     *autoRouted = false;
                     m_iface->SetCommitFlags( 0 );
                 }
 
-                // Warp the mouse so the user is at the point we managed to route to
                 controls()->WarpMouseCursor( m_router->Placer()->CurrentEnd(), true, true );
             }
         }
@@ -1910,12 +1930,10 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
             {
                 syncRouterAndFrameLayer();
                 m_startSnapPoint = m_router->Placer()->CurrentStart();
+                lastFixedPoint   = m_startSnapPoint;
                 updateEndItem( *evt );
 
-                // Warp the mouse to wherever we actually ended up routing to
                 controls()->WarpMouseCursor( m_router->Placer()->CurrentEnd(), true, true );
-
-                // We want the next router commit to be one undo at the UI layer
                 m_iface->SetCommitFlags( needsAppend ? APPEND_UNDO : 0 );
             }
             else
@@ -1923,9 +1941,7 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
                 frame()->ShowInfoBarError( m_router->FailureReason(), true );
             }
         }
-        else if( evt->IsClick( BUT_LEFT )
-                     || evt->IsDrag( BUT_LEFT )
-                     || evt->IsAction( &PCB_ACTIONS::routeSingleTrack ) )
+        else if( evt->IsClick( BUT_LEFT ) || evt->IsDrag( BUT_LEFT ) )
         {
             updateEndItem( *evt );
             bool needLayerSwitch = m_router->IsPlacingVia();
@@ -1933,6 +1949,10 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
 
             if( m_router->FixRoute( m_endSnapPoint, m_endItem, false, forceCommit ) )
                 break;
+
+            // 🌟 记录用户左键确认的拐点位置
+            hasFixedPoints = true;
+            lastFixedPoint = m_endSnapPoint;
 
             if( needLayerSwitch )
             {
@@ -1943,7 +1963,6 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
                 updateSizesAfterRouterEvent( m_router->GetCurrentLayer(), m_endSnapPoint );
             }
 
-            // Synchronize the indicated layer
             syncRouterAndFrameLayer();
 
             updateEndItem( *evt );
@@ -1954,9 +1973,6 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
         {
             onViaStackCommand( *evt );
 
-            // A staggered drop fixes the track and queues the stack, break so the normal
-            // teardown runs (restores the cursor) and the generator is committed after the
-            // PNS world is gone.
             if( m_pendingViaStack || !m_router->RoutingInProgress() )
                 break;
 
@@ -1967,7 +1983,7 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
         {
             m_router->FlipPosture();
             updateEndItem( *evt );
-            m_router->Move( m_endSnapPoint, m_endItem );        // refresh
+            m_router->Move( m_endSnapPoint, m_endItem );
         }
         else if( evt->IsAction( &PCB_ACTIONS::properties ) )
         {
@@ -1980,9 +1996,8 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
             setCursor();
             UpdateMessagePanel();
         }
-        else if( evt->IsAction( &ACTIONS::finishInteractive ) || evt->IsDblClick( BUT_LEFT )  )
+        else if( evt->IsAction( &ACTIONS::finishInteractive ) || evt->IsDblClick( BUT_LEFT ) )
         {
-            // Stop current routing:
             bool forceFinish = true;
             bool forceCommit = false;
 
@@ -2005,16 +2020,30 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
         }
         else if( evt->IsUndoRedo() )
         {
-            // We're in an UndoRedoBlock.  If we get here, something's broken.
             wxFAIL;
             break;
         }
         else if( evt->IsClick( BUT_RIGHT ) )
         {
-            m_menu->ShowContextMenu( selection() );
+            // 🌟 蓝兔智营核心修复：
+            // 如果已经左键点过拐点或打过过孔，按右键时保留所有已点过的线段与过孔，
+            // 仅将末尾跟随鼠标的未落点悬空段缩回 lastFixedPoint 并提交！
+            if( hasFixedPoints || ( m_router->Placer() && m_router->Placer()->HasPlacedAnything() ) )
+            {
+                if( m_router->IsPlacingVia() )
+                    m_router->ToggleViaPlacement();
+
+                m_router->Move( lastFixedPoint, nullptr );
+                m_router->FixRoute( lastFixedPoint, nullptr, true, false );
+            }
+            else
+            {
+                // 如果只点了起点焊盘、还没点过任何中间点，按右键则直接取消当前拉线
+                m_router->AbortPlacement();
+            }
+
+            break;
         }
-        // TODO: It'd be nice to be able to say "don't allow any non-trivial editing actions",
-        // but we don't at present have that, so we just knock out some of the egregious ones.
         else if( ZONE_FILLER_TOOL::IsZoneFillAction( evt ) )
         {
             wxBell();
@@ -2026,12 +2055,10 @@ void ROUTER_TOOL::performRouting( VECTOR2D aStartPosition )
     }
 
     m_router->CommitRouting();
-    // Reset to normal for next route
     m_iface->SetCommitFlags( 0 );
 
     finishInteractive();
 
-    // The PNS world is now torn down, so it is safe to add a queued staggered stack to the board.
     if( m_pendingViaStack )
         commitPendingViaStack();
 }
@@ -2392,7 +2419,7 @@ int ROUTER_TOOL::MainLoop( const TOOL_EVENT& aEvent )
     // Deselect all items
     m_toolMgr->RunAction( ACTIONS::selectionClear );
 
-    TOOL_EVENT         originalEvent = aEvent;          // This can change out from under us when the event loop runs
+    TOOL_EVENT         originalEvent = aEvent;
     SCOPED_TOOL_PUSHER raii( frame, originalEvent );
 
     auto setCursor =
@@ -2402,24 +2429,22 @@ int ROUTER_TOOL::MainLoop( const TOOL_EVENT& aEvent )
             };
 
     Activate();
-    // Must be done after Activate() so that it gets set into the correct context
     controls->ShowCursor( true );
     controls->ForceCursorPosition( false );
-    // Set initial cursor
     setCursor();
 
     m_router->SetMode( mode );
     m_cancelled = false;
     m_startWithVia = false;
 
-    if( aEvent.HasPosition() )
-        m_toolMgr->PrimeTool( aEvent.Position() );
+    // 🌟 蓝兔智营核心修改：去掉 PrimeTool()！
+    // 按 Alt+W 后只把光标切换成铅笔布线状态，绝不在光标位置直接放线；
+    // 只有当用户左键点击板子上的焊盘、已有走线或点位时才开始拉线！
+    updateStartItem( const_cast<TOOL_EVENT&>( aEvent ) );
 
     // Main loop: keep receiving events
     while( TOOL_EVENT* evt = Wait() )
     {
-        // Snapping uses ViewGetLOD(), which uses the layerVisibilityCache.  Catch any visibility
-        // changes while routing.
         m_toolMgr->GetView()->SyncLayerVisibilityCache();
 
         if( !evt->IsDrag() )
@@ -2429,11 +2454,55 @@ int ROUTER_TOOL::MainLoop( const TOOL_EVENT& aEvent )
         {
             break;
         }
+        else if( evt->IsAction( &PCB_ACTIONS::routeSingleTrack )
+                 || evt->IsAction( &PCB_ACTIONS::routeDiffPair ) )
+        {
+            // 已处于布线准备状态时再次按 Alt+W，保持布线光标，不自动落线
+            evt->SetPassEvent( false );
+            continue;
+        }
+        else if( evt->IsAction( &ACT_PlaceThroughVia )
+                 || evt->IsAction( &PCB_ACTIONS::layerToggle )
+                 || evt->IsAction( &PCB_ACTIONS::drawVia )
+                 || ( evt->IsKeyPressed() && ( evt->KeyCode() == 'V' || evt->KeyCode() == 'v' ) ) )
+        {
+            evt->SetPassEvent( false );
+            handleLayerSwitch( PCB_ACTIONS::layerToggle.MakeEvent(), false );
+        }
+        else if( evt->IsActionInGroup( PCB_ACTIONS::layerDirectSwitchActions() )
+                 || evt->IsAction( &PCB_ACTIONS::layerNext )
+                 || evt->IsAction( &PCB_ACTIONS::layerPrev ) )
+        {
+            evt->SetPassEvent( false );
+            handleLayerSwitch( *evt, false );
+        }
+        else if( evt->IsKeyPressed() && !evt->Modifier() && evt->KeyCode() >= '0' && evt->KeyCode() <= '9' )
+        {
+            evt->SetPassEvent( false );
+            const TOOL_ACTION* layerAct = nullptr;
+
+            switch( evt->KeyCode() )
+            {
+            case '1': layerAct = &PCB_ACTIONS::layerTop;    break; // 1 -> F.Cu (顶层)
+            case '2': layerAct = &PCB_ACTIONS::layerInner1; break; // 2 -> In1.Cu (内层1)
+            case '3': layerAct = &PCB_ACTIONS::layerInner2; break; // 3 -> In2.Cu (内层2)
+            case '4': layerAct = &PCB_ACTIONS::layerInner3; break; // 4 -> In3.Cu (内层3)
+            case '5': layerAct = &PCB_ACTIONS::layerInner4; break; // 5 -> In4.Cu (内层4)
+            case '6': layerAct = &PCB_ACTIONS::layerInner5; break; // 6 -> In5.Cu (内层5)
+            case '7': layerAct = &PCB_ACTIONS::layerInner6; break; // 7 -> In6.Cu (内层6)
+            case '8': layerAct = &PCB_ACTIONS::layerInner7; break; // 8 -> In7.Cu (内层7)
+            case '9': layerAct = &PCB_ACTIONS::layerInner8; break; // 9 -> In8.Cu (内层8)
+            case '0': layerAct = &PCB_ACTIONS::layerBottom; break; // 0 -> B.Cu (底层)
+            default: break;
+            }
+
+            if( layerAct )
+                handleLayerSwitch( layerAct->MakeEvent(), false );
+        }
         else if( evt->IsActivate() )
         {
             if( evt->IsMoveTool() || evt->IsEditorTool() )
             {
-                // Make sure we come back after the move tool runs
                 frame->PushTool( originalEvent );
             }
 
@@ -2464,22 +2533,16 @@ int ROUTER_TOOL::MainLoop( const TOOL_EVENT& aEvent )
         else if( evt->IsAction( &PCB_ACTIONS::breakTrack ) )
         {
             updateStartItem( *evt, true );
-            breakTrack( );
+            breakTrack();
             evt->SetPassEvent( false );
         }
-        else if( evt->IsClick( BUT_LEFT )
-              || evt->IsAction( &PCB_ACTIONS::routeSingleTrack )
-              || evt->IsAction( &PCB_ACTIONS::routeDiffPair ) )
+        // 🌟 蓝兔智营核心修改：只有左键点击 (BUT_LEFT) 时才开始拉线！
+        else if( evt->IsClick( BUT_LEFT ) )
         {
             updateStartItem( *evt );
 
             if( evt->HasPosition() )
                 performRouting( evt->Position() );
-        }
-        else if( evt->IsAction( &ACT_PlaceThroughVia ) )
-        {
-            m_startWithVia = true;
-            m_toolMgr->RunAction( PCB_ACTIONS::layerToggle );
         }
         else if( evt->IsAction( &PCB_ACTIONS::layerChanged ) )
         {
@@ -2489,14 +2552,12 @@ int ROUTER_TOOL::MainLoop( const TOOL_EVENT& aEvent )
         }
         else if( evt->IsKeyPressed() )
         {
-            // wxWidgets fails to correctly translate shifted keycodes on the wxEVT_CHAR_HOOK
-            // event so we need to process the wxEVT_CHAR event that will follow as long as we
-            // pass the event.
             evt->SetPassEvent();
         }
         else if( evt->IsClick( BUT_RIGHT ) )
         {
-            m_menu->ShowContextMenu( selection() );
+            // 🌟 蓝兔智营修改：未在拉线时按右键，直接退出布线工具回到选择箭头模式
+            break;
         }
         else
         {

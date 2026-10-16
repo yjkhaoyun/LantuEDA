@@ -509,7 +509,7 @@ TOOL_ACTION PCB_ACTIONS::drawTable( TOOL_ACTION_ARGS()
 TOOL_ACTION PCB_ACTIONS::spacingIncrease( TOOL_ACTION_ARGS()
         .Name( "pcbnew.lengthTuner.SpacingIncrease" )
         .Scope( AS_GLOBAL )
-        .DefaultHotkey( '1' )
+        .DefaultHotkey( MD_CTRL + MD_SHIFT + '1' ) // 🌟 释放 '1' 给顶层切换
         .LegacyHotkeyName( "Increase meander spacing by one step." )
         .FriendlyName( _( "Increase Spacing" ) )
         .Tooltip( _( "Increase tuning pattern spacing by one step." ) )
@@ -527,7 +527,7 @@ TOOL_ACTION PCB_ACTIONS::spacingDecrease( TOOL_ACTION_ARGS()
 TOOL_ACTION PCB_ACTIONS::amplIncrease( TOOL_ACTION_ARGS()
         .Name( "pcbnew.lengthTuner.AmplIncrease" )
         .Scope( AS_GLOBAL )
-        .DefaultHotkey( '3' )
+        .DefaultHotkey( MD_CTRL + MD_SHIFT + '3' ) // 🌟 释放 '3' 给内层1切换
         .LegacyHotkeyName( "Increase meander amplitude by one step." )
         .FriendlyName( _( "Increase Amplitude" ) )
         .Tooltip( _( "Increase tuning pattern amplitude by one step." ) )
@@ -536,7 +536,7 @@ TOOL_ACTION PCB_ACTIONS::amplIncrease( TOOL_ACTION_ARGS()
 TOOL_ACTION PCB_ACTIONS::amplDecrease( TOOL_ACTION_ARGS()
         .Name( "pcbnew.lengthTuner.AmplDecrease" )
         .Scope( AS_GLOBAL )
-        .DefaultHotkey( '4' )
+        .DefaultHotkey( MD_CTRL + MD_SHIFT + '4' ) // 🌟 释放 '4' 给内层2切换
         .LegacyHotkeyName( "Decrease meander amplitude by one step." )
         .FriendlyName( _( "Decrease Amplitude" ) )
         .Tooltip( _( "Decrease tuning pattern amplitude by one step." ) )
@@ -613,7 +613,7 @@ TOOL_ACTION PCB_ACTIONS::drawCopperThievingZone( TOOL_ACTION_ARGS()
 TOOL_ACTION PCB_ACTIONS::drawVia( TOOL_ACTION_ARGS()
         .Name( "pcbnew.InteractiveDrawing.via" )
         .Scope( AS_GLOBAL )
-        .DefaultHotkey( MD_CTRL + MD_SHIFT + 'X' )
+        .DefaultHotkey( MD_CTRL + MD_SHIFT + 'X' ) // 🌟 避免全局 AF_ACTIVATE 抢占布线过程中的 Alt+V
         .LegacyHotkeyName( "Add Vias" )
         .FriendlyName( _( "Place Vias" ) )
         .Tooltip( _( "Place free-standing vias" ) )
@@ -2233,82 +2233,99 @@ TOOL_ACTION_GROUP PCB_ACTIONS::layerDirectSwitchActions()
     return s_toolActionGroup;
 }
 
+// 顶层 = '1'
 TOOL_ACTION PCB_ACTIONS::layerTop( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerTop" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
-        .DefaultHotkey( WXK_PAGEUP )
+        .DefaultHotkey( '1' )
         .LegacyHotkeyName( "Switch to Component (F.Cu) layer" )
         .FriendlyName( _( "Switch to Component (F.Cu) layer" ) )
         .Flags( AF_NOTIFY )
         .Parameter( F_Cu ) );
 
+// 🌟 内层1 (In1.Cu) = '2'
 TOOL_ACTION PCB_ACTIONS::layerInner1( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerInner1" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
+        .DefaultHotkey( '2' )
         .LegacyHotkeyName( "Switch to Inner layer 1" )
         .FriendlyName( _( "Switch to Inner Layer 1" ) )
         .Flags( AF_NOTIFY )
         .Parameter( In1_Cu ) );
 
+// 🌟 内层2 (In2.Cu) = '3'
 TOOL_ACTION PCB_ACTIONS::layerInner2( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerInner2" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
+        .DefaultHotkey( '3' )
         .LegacyHotkeyName( "Switch to Inner layer 2" )
         .FriendlyName( _( "Switch to Inner Layer 2" ) )
         .Flags( AF_NOTIFY )
         .Parameter( In2_Cu ) );
 
+// 🌟 内层3 (In3.Cu) = '4'
 TOOL_ACTION PCB_ACTIONS::layerInner3( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerInner3" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
+        .DefaultHotkey( '4' )
         .LegacyHotkeyName( "Switch to Inner layer 3" )
         .FriendlyName( _( "Switch to Inner Layer 3" ) )
         .Flags( AF_NOTIFY )
         .Parameter( In3_Cu ) );
 
+// 🌟 内层4 (In4.Cu) = '5'
 TOOL_ACTION PCB_ACTIONS::layerInner4( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerInner4" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
+        .DefaultHotkey( '5' )
         .LegacyHotkeyName( "Switch to Inner layer 4" )
         .FriendlyName( _( "Switch to Inner Layer 4" ) )
         .Flags( AF_NOTIFY )
         .Parameter( In4_Cu ) );
 
+// 🌟 内层5 (In5.Cu) = '6'
 TOOL_ACTION PCB_ACTIONS::layerInner5( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerInner5" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
+        .DefaultHotkey( '6' )
         .LegacyHotkeyName( "Switch to Inner layer 5" )
         .FriendlyName( _( "Switch to Inner Layer 5" ) )
         .Flags( AF_NOTIFY )
         .Parameter( In5_Cu ) );
 
+// 🌟 内层6 (In6.Cu) = '7'
 TOOL_ACTION PCB_ACTIONS::layerInner6( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerInner6" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
+        .DefaultHotkey( '7' )
         .LegacyHotkeyName( "Switch to Inner layer 6" )
         .FriendlyName( _( "Switch to Inner Layer 6" ) )
         .Flags( AF_NOTIFY )
         .Parameter( In6_Cu ) );
 
+// 🌟 内层7 (In7.Cu) = '8'
 TOOL_ACTION PCB_ACTIONS::layerInner7( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerInner7" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
+        .DefaultHotkey( '8' )
         .FriendlyName( _( "Switch to Inner Layer 7" ) )
         .Flags( AF_NOTIFY )
         .Parameter( In7_Cu ) );
 
+// 🌟 内层8 (In8.Cu) = '9'
 TOOL_ACTION PCB_ACTIONS::layerInner8( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerInner8" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
+        .DefaultHotkey( '9' )
         .FriendlyName( _( "Switch to Inner Layer 8" ) )
         .Flags( AF_NOTIFY )
         .Parameter( In8_Cu ) );
@@ -2493,7 +2510,7 @@ TOOL_ACTION PCB_ACTIONS::layerBottom( TOOL_ACTION_ARGS()
         .Name( "pcbnew.Control.layerBottom" )
         .Scope( AS_GLOBAL )
         .Group( PCB_ACTIONS::layerDirectSwitchActions() )
-        .DefaultHotkey( WXK_PAGEDOWN )
+        .DefaultHotkey( '0' )
         .LegacyHotkeyName( "Switch to Copper (B.Cu) layer" )
         .FriendlyName( _( "Switch to Copper (B.Cu) Layer" ) )
         .Flags( AF_NOTIFY )
@@ -2956,7 +2973,7 @@ TOOL_ACTION PCB_ACTIONS::repeatLayout( TOOL_ACTION_ARGS()
 TOOL_ACTION PCB_ACTIONS::routeSingleTrack( TOOL_ACTION_ARGS()
         .Name( "pcbnew.InteractiveRouter.SingleTrack" )
         .Scope( AS_GLOBAL )
-        .DefaultHotkey( 'X' )
+        .DefaultHotkey( MD_ALT + 'W' )
         .LegacyHotkeyName( "Add New Track" )
         .FriendlyName( _( "Route Single Track" ) )
         .Tooltip( _( "Route tracks" ) )

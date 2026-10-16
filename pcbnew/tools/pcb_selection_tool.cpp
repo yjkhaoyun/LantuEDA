@@ -259,6 +259,7 @@ PCB_SELECTION_TOOL::~PCB_SELECTION_TOOL()
 }
 
 
+
 bool PCB_SELECTION_TOOL::Init()
 {
     PCB_BASE_FRAME* frame = getEditFrame<PCB_BASE_FRAME>();
@@ -327,13 +328,13 @@ bool PCB_SELECTION_TOOL::Init()
             return false;
         BOARD_ITEM* item = static_cast<BOARD_ITEM*>( *aSel.begin() );
         return item->Type() == PCB_PAD_T || item->Type() == PCB_VIA_T || item->Type() == PCB_TRACE_T
-               || item->Type() == PCB_ARC_T;
+                || item->Type() == PCB_ARC_T;
     };
 
     if( frame && frame->IsType( FRAME_PCB_EDITOR ) )
     {
-        menu.AddMenu( selectMenu.get(), SELECTION_CONDITIONS::NotEmpty  );
-    menu.AddMenu( netChainsMenu.get(), netItemSelection );
+        menu.AddMenu( selectMenu.get(), SELECTION_CONDITIONS::NotEmpty );
+        menu.AddMenu( netChainsMenu.get(), netItemSelection );
         menu.AddSeparator( 1000 );
     }
 
@@ -360,6 +361,79 @@ bool PCB_SELECTION_TOOL::Init()
     Connect( m_disambiguateTimer.GetId(), wxEVT_TIMER,
              wxTimerEventHandler( PCB_SELECTION_TOOL::onDisambiguationExpire ), nullptr, this );
 
+    // 🌟 蓝兔智营新增：嘉立创风格——鼠标悬停在某根布线/过孔/焊盘上时，该网络的所有布线和焊点同步高亮
+    if( frame && frame->IsType( FRAME_PCB_EDITOR ) && frame->GetCanvas() )
+    {
+        frame->GetCanvas()->Bind(
+                wxEVT_MOTION,
+                [this]( wxMouseEvent& aEvt )
+                {
+                    aEvt.Skip();
+
+                    if( !m_frame || m_isFootprintEditor || !board() || !getView() || !getView()->GetPainter() )
+                        return;
+
+                    // 如果正在交互式拉线中，交由 ROUTER_TOOL 自身管理高亮，互不干扰
+                    if( ROUTER_TOOL* router = m_toolMgr->GetTool<ROUTER_TOOL>() )
+                    {
+                        if( router->RoutingInProgress() )
+                            return;
+                    }
+
+                    KIGFX::RENDER_SETTINGS* rSettings = getView()->GetPainter()->GetSettings();
+
+                    if( !rSettings )
+                        return;
+
+                    // 确保飞线颜色始终保持嘉立创经典的 RGB(100, 100, 255)
+                    rSettings->SetLayerColor( LAYER_RATSNEST,
+                                              KIGFX::COLOR4D( 100.0 / 255.0, 100.0 / 255.0, 1.0, 1.0 ) );
+
+                    VECTOR2D worldPosD = getView()->ToWorld( VECTOR2D( aEvt.GetX(), aEvt.GetY() ) );
+                    VECTOR2I worldPos( KiROUND( worldPosD.x ), KiROUND( worldPosD.y ) );
+
+                    GENERAL_COLLECTOR collector;
+                    collector.Collect( board(), { PCB_TRACE_T, PCB_ARC_T, PCB_VIA_T, PCB_PAD_T },
+                                       worldPos, getCollectorsGuide() );
+
+                    int          hoveredNetCode = -1;
+                    PCB_LAYER_ID activeLayer    = m_frame->GetActiveLayer();
+
+                    for( int i = 0; i < collector.GetCount(); ++i )
+                    {
+                        if( !Selectable( collector[i] ) )
+                            continue;
+
+                        if( BOARD_CONNECTED_ITEM* connItem = dynamic_cast<BOARD_CONNECTED_ITEM*>( collector[i] ) )
+                        {
+                            if( connItem->GetNetCode() > 0 )
+                            {
+                                hoveredNetCode = connItem->GetNetCode();
+
+                                // 优先命中当前活动层的走线或焊盘
+                                if( connItem->IsOnLayer( activeLayer ) )
+                                    break;
+                            }
+                        }
+                    }
+
+                    static int s_lastHoveredNetCode = -1;
+
+                    if( hoveredNetCode != s_lastHoveredNetCode )
+                    {
+                        s_lastHoveredNetCode = hoveredNetCode;
+
+                        if( hoveredNetCode > 0 )
+                            rSettings->SetHighlight( true, hoveredNetCode );
+                        else
+                            rSettings->SetHighlight( false );
+
+                        getView()->UpdateAllLayersColor();
+                        m_frame->GetCanvas()->Refresh();
+                    }
+                } );
+    }
+
     return true;
 }
 
@@ -382,6 +456,14 @@ void PCB_SELECTION_TOOL::Reset( RESET_REASON aReason )
     if( aReason == TOOL_BASE::MODEL_RELOAD )
         getView()->GetPainter()->GetSettings()->SetHighlight( false );
 
+    // 🌟 蓝兔智营新增：初始化/重置画布时，强制将飞线 (Ratsnest) 颜色设为嘉立创同款蓝紫色 RGB(100, 100, 255)
+    if( getView() && getView()->GetPainter() && getView()->GetPainter()->GetSettings() )
+    {
+        getView()->GetPainter()->GetSettings()->SetLayerColor(
+                LAYER_RATSNEST, KIGFX::COLOR4D( 100.0 / 255.0, 100.0 / 255.0, 1.0, 1.0 ) );
+        getView()->UpdateLayerColor( LAYER_RATSNEST );
+    }
+
     // Reinsert the VIEW_GROUP, in case it was removed from the VIEW
     view()->Remove( &m_selection );
     view()->Add( &m_selection );
@@ -389,6 +471,8 @@ void PCB_SELECTION_TOOL::Reset( RESET_REASON aReason )
     view()->Remove( &m_enteredGroupOverlay );
     view()->Add( &m_enteredGroupOverlay );
 }
+
+
 
 
 void PCB_SELECTION_TOOL::OnIdle( wxIdleEvent& aEvent )
