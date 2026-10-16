@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <set>
 #include <string_utils.h>
+#include <trigo.h> // 🌟 新增：用于判断点与导线的几何连接关系
 #include <sch_bitmap.h>
 #include <sch_bus_entry.h>
 #include <sch_commit.h>
@@ -604,6 +605,7 @@ bool SCH_EDIT_TOOL::Init()
                 case SCH_SHAPE_T:
                 case SCH_BITMAP_T:
                 case SCH_GROUP_T:
+                case SCH_PIN_T:
                     return aSel.GetSize() == 1;
 
                 case SCH_LINE_T:
@@ -982,6 +984,73 @@ bool SCH_EDIT_TOOL::Init()
     mgr->SetConditions( SCH_ACTIONS::setExcludeFromBoard, ACTION_CONDITIONS().Check( attribExcludeFromBoardCond ) );
     mgr->SetConditions( SCH_ACTIONS::setExcludeFromPosFiles,
                         ACTION_CONDITIONS().Check( attribExcludeFromPosFilesCond ) );
+    
+    // 🌟 蓝兔智营新增：鼠标移动到某个引脚（含引脚号、引脚名）时，该引脚自动显示高亮
+    if( m_frame && m_frame->GetCanvas() )
+    {
+        m_frame->GetCanvas()->Bind(
+                wxEVT_MOTION,
+                [this]( wxMouseEvent& aEvt )
+                {
+                    aEvt.Skip();
+
+                    if( !m_frame || !m_frame->GetScreen() || !m_frame->GetCanvas() || !getView() || !m_selectionTool )
+                        return;
+
+                    VECTOR2D worldPosD = getView()->ToWorld( VECTOR2D( aEvt.GetX(), aEvt.GetY() ) );
+                    VECTOR2I worldPos( KiROUND( worldPosD.x ), KiROUND( worldPosD.y ) );
+
+                    SCH_PIN*              hoveredPin = nullptr;
+                    const SCH_SHEET_PATH& sheetPath  = m_frame->GetCurrentSheet();
+                    const int             hitRadius  = schIUScale.MilsToIU( 25 );
+
+                    for( EDA_ITEM* symItem : m_frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+                    {
+                        SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+
+                        for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
+                        {
+                            if( pin->HitTest( worldPos, hitRadius ) || pin->GetBoundingBox().Contains( worldPos ) )
+                            {
+                                hoveredPin = pin;
+                                break;
+                            }
+                        }
+
+                        if( hoveredPin )
+                            break;
+                    }
+
+                    bool changed = false;
+
+                    for( EDA_ITEM* symItem : m_frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+                    {
+                        SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+
+                        for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
+                        {
+                            if( pin == hoveredPin )
+                            {
+                                if( !pin->IsBrightened() )
+                                {
+                                    m_selectionTool->BrightenItem( pin );
+                                    getView()->Update( sym, KIGFX::APPEARANCE );
+                                    changed = true;
+                                }
+                            }
+                            else if( pin->IsBrightened() )
+                            {
+                                m_selectionTool->UnbrightenItem( pin );
+                                getView()->Update( sym, KIGFX::APPEARANCE );
+                                changed = true;
+                            }
+                        }
+                    }
+
+                    if( changed )
+                        m_frame->GetCanvas()->Refresh();
+                } );
+    }
 
     return true;
 }
@@ -2299,7 +2368,7 @@ int SCH_EDIT_TOOL::RepeatDrawItem( const TOOL_EVENT& aEvent )
 
 int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
 {
-    SCH_SCREEN*           screen = m_frame->GetScreen();
+    SCH_SCREEN*            screen = m_frame->GetScreen();
 
     m_selectionTool->RequestSelection( SCH_COLLECTOR::DeletableItems );
     m_selectionTool->FilterSelectionForLockedItems();
@@ -2311,6 +2380,56 @@ int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
 
     if( items.empty() )
         return 0;
+
+    // 🌟 蓝兔智营修改：标签名与引脚延长线是一体的，删除其中一个时自动同步删除另一个
+    std::vector<EDA_ITEM*> extraIntegratedItems;
+
+    for( EDA_ITEM* item : items )
+    {
+        if( item->Type() == SCH_LINE_T )
+        {
+            SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+            if( wire->IsWire() )
+            {
+                for( EDA_ITEM* lblItem : screen->Items() )
+                {
+                    if( lblItem->Type() == SCH_LABEL_T || lblItem->Type() == SCH_GLOBAL_LABEL_T
+                        || lblItem->Type() == SCH_HIER_LABEL_T )
+                    {
+                        SCH_LABEL_BASE* lbl = static_cast<SCH_LABEL_BASE*>( lblItem );
+
+                        if( IsPointOnSegment( wire->GetStartPoint(), wire->GetEndPoint(), lbl->GetPosition() )
+                            && !alg::contains( items, lblItem )
+                            && !alg::contains( extraIntegratedItems, lblItem ) )
+                        {
+                            extraIntegratedItems.push_back( lblItem );
+                        }
+                    }
+                }
+            }
+        }
+        else if( item->Type() == SCH_LABEL_T || item->Type() == SCH_GLOBAL_LABEL_T || item->Type() == SCH_HIER_LABEL_T )
+        {
+            SCH_LABEL_BASE* lbl = static_cast<SCH_LABEL_BASE*>( item );
+
+            for( EDA_ITEM* lineItem : screen->Items().OfType( SCH_LINE_T ) )
+            {
+                SCH_LINE* wire = static_cast<SCH_LINE*>( lineItem );
+
+                if( wire->IsWire()
+                    && IsPointOnSegment( wire->GetStartPoint(), wire->GetEndPoint(), lbl->GetPosition() )
+                    && !alg::contains( items, lineItem )
+                    && !alg::contains( extraIntegratedItems, lineItem ) )
+                {
+                    extraIntegratedItems.push_back( lineItem );
+                }
+            }
+        }
+    }
+
+    for( EDA_ITEM* extra : extraIntegratedItems )
+        items.push_back( extra );
 
     // Don't leave a freed pointer in the selection
     m_toolMgr->RunAction( ACTIONS::selectionClear );
@@ -2334,7 +2453,6 @@ int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
         if( sch_item->Type() == SCH_JUNCTION_T )
         {
             sch_item->SetFlags( STRUCT_DELETED );
-            // clean up junctions at the end
         }
         else if( sch_item->Type() == SCH_SHEET_PIN_T )
         {
@@ -2349,13 +2467,11 @@ int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
         }
         else if( sch_item->Type() == SCH_FIELD_T )
         {
-            // Hide field
             commit.Modify( item, m_frame->GetScreen() );
             static_cast<SCH_FIELD*>( sch_item )->SetVisible( false );
         }
         else if( sch_item->Type() == SCH_TABLECELL_T )
         {
-            // Clear contents of table cell
             commit.Modify( item, m_frame->GetScreen() );
             static_cast<SCH_TABLECELL*>( sch_item )->SetText( wxEmptyString );
         }
@@ -2366,7 +2482,6 @@ int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
         }
         else if( sch_item->Type() == SCH_GROUP_T )
         {
-            // Groups need to delete their children
             sch_item->RunOnChildren(
                     [&]( SCH_ITEM* aChild )
                     {
@@ -2822,13 +2937,352 @@ int SCH_EDIT_TOOL::CycleBodyStyle( const TOOL_EVENT& aEvent )
 }
 
 
+// =========================================================================
+// 🌟 蓝兔智营核心引擎：引脚 / 引脚延长线 / 网络标签 一体化添加与修改
+// =========================================================================
+static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGER* aToolMgr,
+                                             SCH_PIN* aPin, SCH_LINE* aWire, SCH_LABEL_BASE* aLabel )
+{
+    if( !aFrame || !aFrame->GetScreen() )
+        return;
+
+    SCH_SCREEN*           screen    = aFrame->GetScreen();
+    const SCH_SHEET_PATH& sheetPath = aFrame->GetCurrentSheet();
+    SCHEMATIC_SETTINGS&   settings  = aFrame->Schematic().Settings();
+
+    // 1. 如果从标签进来，反查它所属的延长线
+    if( aLabel && !aWire )
+    {
+        for( EDA_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+        {
+            SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+            if( line->IsWire() && IsPointOnSegment( line->GetStartPoint(), line->GetEndPoint(), aLabel->GetPosition() ) )
+            {
+                aWire = line;
+                break;
+            }
+        }
+    }
+
+    // 2. 如果从引脚进来，查找是否已经有连接在该引脚上的延长线
+    if( aPin && !aWire )
+    {
+        VECTOR2I pinPos = aPin->GetPosition();
+
+        for( EDA_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+        {
+            SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+            if( line->IsWire() && ( line->GetStartPoint() == pinPos || line->GetEndPoint() == pinPos ) )
+            {
+                aWire = line;
+                break;
+            }
+        }
+    }
+
+    // 3. 如果从延长线进来，反查它连接的是哪个引脚
+    if( aWire && !aPin )
+    {
+        for( EDA_ITEM* symItem : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+
+            for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
+            {
+                if( pin->GetPosition() == aWire->GetStartPoint() || pin->GetPosition() == aWire->GetEndPoint() )
+                {
+                    aPin = pin;
+                    break;
+                }
+            }
+
+            if( aPin )
+                break;
+        }
+    }
+
+    // 4. 查找该引脚或延长线上是否已经存在网络标签
+    if( !aLabel )
+    {
+        for( EDA_ITEM* item : screen->Items() )
+        {
+            if( item->Type() != SCH_LABEL_T && item->Type() != SCH_GLOBAL_LABEL_T && item->Type() != SCH_HIER_LABEL_T )
+                continue;
+
+            SCH_LABEL_BASE* lbl = static_cast<SCH_LABEL_BASE*>( item );
+
+            if( aWire && IsPointOnSegment( aWire->GetStartPoint(), aWire->GetEndPoint(), lbl->GetPosition() ) )
+            {
+                aLabel = lbl;
+                break;
+            }
+
+            if( aPin && lbl->GetPosition() == aPin->GetPosition() )
+            {
+                aLabel = lbl;
+                break;
+            }
+        }
+    }
+
+    // 5. 计算默认显示的标签名（已有标签则用原名；无标签则提取引脚名）
+    wxString defaultText;
+
+    if( aLabel )
+    {
+        defaultText = UnescapeString( aLabel->GetText() );
+    }
+    else if( aPin )
+    {
+        defaultText = aPin->GetName();
+
+        if( defaultText.IsEmpty() || defaultText == wxS( "~" ) )
+        {
+            defaultText = aPin->GetNumber();
+        }
+        else
+        {
+            defaultText.Replace( wxS( "~{" ), wxS( "" ) );
+            defaultText.Replace( wxS( "}" ), wxS( "" ) );
+            defaultText.Replace( wxS( "~" ), wxS( "" ) );
+            defaultText.Replace( wxS( " " ), wxS( "_" ) );
+        }
+
+        if( defaultText.IsEmpty() )
+            defaultText = wxS( "NET" );
+    }
+    else
+    {
+        defaultText = wxS( "NET" );
+    }
+
+    wxTextEntryDialog dlg( aFrame,
+                           _( "请输入网络标签名称 (清空后确定可删除该标签与延长线):" ),
+                           aLabel ? _( "修改网络标签" ) : _( "添加网络标签" ),
+                           defaultText );
+
+    if( dlg.ShowModal() != wxID_OK )
+        return;
+
+    wxString newText = dlg.GetValue().Trim( true ).Trim( false );
+
+    SCH_COMMIT commit( aToolMgr );
+
+    // 6. 如果用户清空了输入框，则将已有标签与单端引脚延长线一并删除
+    if( newText.IsEmpty() )
+    {
+        if( aLabel )
+        {
+            commit.Remove( aLabel, screen );
+            aFrame->RemoveFromScreen( aLabel, screen );
+        }
+
+        if( aWire && aPin )
+        {
+            commit.Remove( aWire, screen );
+            aFrame->RemoveFromScreen( aWire, screen );
+        }
+
+        if( !commit.Empty() )
+        {
+            aFrame->Schematic().CleanUp( &commit );
+            aFrame->TestDanglingEnds();
+            aFrame->OnModify();
+            commit.Push( _( "Remove Pin Label" ) );
+        }
+
+        return;
+    }
+
+    wxString escapedText = EscapeString( newText, CTX_NETNAME );
+
+    // 7. 计算引脚朝外延伸的精确方向向量 dir
+    VECTOR2I dir( -1, 0 );
+
+    if( aPin )
+    {
+        VECTOR2I pinPos = aPin->GetPosition();
+
+        if( aWire )
+        {
+            VECTOR2I otherEnd = ( aWire->GetStartPoint() == pinPos ) ? aWire->GetEndPoint() : aWire->GetStartPoint();
+            VECTOR2I wDelta   = otherEnd - pinPos;
+
+            if( std::abs( wDelta.x ) >= std::abs( wDelta.y ) && wDelta.x != 0 )
+                dir = VECTOR2I( ( wDelta.x < 0 ) ? -1 : 1, 0 );
+            else if( wDelta.y != 0 )
+                dir = VECTOR2I( 0, ( wDelta.y < 0 ) ? -1 : 1 );
+        }
+        else
+        {
+            BOX2I    pinBox = aPin->GetBoundingBox();
+            VECTOR2I pDelta = pinPos - pinBox.GetCenter();
+
+            if( std::abs( pDelta.x ) >= std::abs( pDelta.y ) )
+                dir = VECTOR2I( ( pDelta.x <= 0 ) ? -1 : 1, 0 );
+            else
+                dir = VECTOR2I( 0, ( pDelta.y <= 0 ) ? -1 : 1 );
+        }
+    }
+
+    // 8. 准备标签对象并计算文字物理宽度，以便让延长线长度与标签文字完美一体匹配
+    bool isNewLabel = ( aLabel == nullptr );
+
+    if( isNewLabel )
+    {
+        aLabel = new SCH_LABEL( VECTOR2I( 0, 0 ), escapedText );
+        aLabel->SetParent( screen );
+        aLabel->SetTextSize( VECTOR2I( settings.m_DefaultTextSize, settings.m_DefaultTextSize ) );
+    }
+    else
+    {
+        commit.Modify( aLabel, screen );
+        aLabel->SetText( escapedText );
+    }
+
+    const int gridStep = schIUScale.MilsToIU( 50 );
+    BOX2I     lblBox   = aLabel->GetBoundingBox();
+    int       rawLen   = std::max( lblBox.GetWidth(), lblBox.GetHeight() ) + schIUScale.MilsToIU( 100 );
+    int       stubLen  = std::max( schIUScale.MilsToIU( 300 ),
+                                   ( ( rawLen + gridStep - 1 ) / gridStep ) * gridStep );
+
+    // 9. 如果关联了引脚：自动创建或伸缩引脚延长线，并将标签锚定在延长线外端、文字贴在延长线上方
+    if( aPin )
+    {
+        VECTOR2I pinPos  = aPin->GetPosition();
+        VECTOR2I wireEnd = pinPos + dir * stubLen;
+
+        if( !aWire )
+        {
+            aWire = new SCH_LINE( pinPos, LAYER_WIRE );
+            aWire->SetParent( &aFrame->Schematic() );
+            aWire->SetStartPoint( pinPos );
+            aWire->SetEndPoint( wireEnd );
+            aFrame->AddToScreen( aWire, screen );
+            commit.Added( aWire, screen );
+        }
+        else
+        {
+            // 检查延长线另一端是否悬空（未连接其他元器件引脚）
+            VECTOR2I oldOtherEnd = ( aWire->GetStartPoint() == pinPos ) ? aWire->GetEndPoint() : aWire->GetStartPoint();
+            bool     otherEndConnectedToPin = false;
+
+            for( EDA_ITEM* symItem : screen->Items().OfType( SCH_SYMBOL_T ) )
+            {
+                SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+
+                for( SCH_PIN* p : sym->GetPins( &sheetPath ) )
+                {
+                    if( p != aPin && p->GetPosition() == oldOtherEnd )
+                    {
+                        otherEndConnectedToPin = true;
+                        break;
+                    }
+                }
+
+                if( otherEndConnectedToPin )
+                    break;
+            }
+
+            if( !otherEndConnectedToPin )
+            {
+                commit.Modify( aWire, screen );
+                aWire->SetStartPoint( pinPos );
+                aWire->SetEndPoint( wireEnd );
+                aFrame->UpdateItem( aWire, false, true );
+            }
+            else
+            {
+                wireEnd = ( pinPos + oldOtherEnd ) / 2;
+                wireEnd = aFrame->GetNearestGridPosition( wireEnd );
+            }
+        }
+
+        // 设置标签朝向：锚点在 wireEnd，文字沿着延长线朝向芯片引脚方向铺开（线字一体）
+        if( dir.x < 0 )
+            aLabel->SetSpinStyle( SPIN_STYLE::RIGHT );
+        else if( dir.x > 0 )
+            aLabel->SetSpinStyle( SPIN_STYLE::LEFT );
+        else if( dir.y < 0 )
+            aLabel->SetSpinStyle( SPIN_STYLE::BOTTOM );
+        else
+            aLabel->SetSpinStyle( SPIN_STYLE::UP );
+
+        aLabel->SetPosition( wireEnd );
+    }
+    else if( aWire )
+    {
+        // 普通独立导线（未直接接触引脚）：将标签放在导线中点或端点上方
+        VECTOR2I startPt = aWire->GetStartPoint();
+        VECTOR2I endPt   = aWire->GetEndPoint();
+        VECTOR2I midPt   = aFrame->GetNearestGridPosition( ( startPt + endPt ) / 2 );
+
+        if( std::abs( endPt.x - startPt.x ) >= std::abs( endPt.y - startPt.y ) )
+            aLabel->SetSpinStyle( SPIN_STYLE::RIGHT );
+        else
+            aLabel->SetSpinStyle( SPIN_STYLE::UP );
+
+        if( isNewLabel )
+            aLabel->SetPosition( midPt );
+    }
+
+    aLabel->AutoplaceFields( screen, AUTOPLACE_AUTO );
+
+    if( isNewLabel )
+    {
+        aFrame->AddToScreen( aLabel, screen );
+        commit.Added( aLabel, screen );
+    }
+    else
+    {
+        aFrame->UpdateItem( aLabel, false, true );
+    }
+
+    aFrame->Schematic().CleanUp( &commit );
+    aFrame->TestDanglingEnds();
+    aFrame->OnModify();
+    aFrame->GetCanvas()->Refresh();
+
+    commit.Push( isNewLabel ? _( "Add Pin Net Label" ) : _( "Edit Pin Net Label" ) );
+}
+
+
 int SCH_EDIT_TOOL::Properties( const TOOL_EVENT& aEvent )
 {
     SCH_SELECTION& selection = m_selectionTool->RequestSelection();
     bool           clearSelection = selection.IsHover();
 
+    // 辅助检测：根据当前鼠标位置判断是否双击在某个引脚（含引脚号1H13、引脚名VSS）上
+    auto findHoveredPin = [&]() -> SCH_PIN*
+    {
+        VECTOR2I              mousePos  = getViewControls()->GetMousePosition( false );
+        const SCH_SHEET_PATH& sheetPath = m_frame->GetCurrentSheet();
+        const int             hitRadius = schIUScale.MilsToIU( 30 );
+
+        for( EDA_ITEM* symItem : m_frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+
+            for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
+            {
+                if( pin->HitTest( mousePos, hitRadius ) || pin->GetBoundingBox().Contains( mousePos ) )
+                    return pin;
+            }
+        }
+
+        return nullptr;
+    };
+
     if( selection.Empty() )
     {
+        if( SCH_PIN* hitPin = findHoveredPin() )
+        {
+            editOrAddIntegratedPinWireLabel( m_frame, m_toolMgr, hitPin, nullptr, nullptr );
+            return 0;
+        }
+
         if( getView()->IsLayerVisible( LAYER_SCHEMATIC_DRAWINGSHEET ) )
         {
             DS_PROXY_VIEW_ITEM* ds = m_frame->GetCanvas()->GetView()->GetDrawingSheet();
@@ -2843,13 +3297,31 @@ int SCH_EDIT_TOOL::Properties( const TOOL_EVENT& aEvent )
 
     EDA_ITEM* curr_item = selection.Front();
 
-    // If a single pin is selected, promote to its parent symbol
-    if( ( selection.GetSize() == 1 ) && ( curr_item->Type() == SCH_PIN_T ) )
+    // 🌟 蓝兔智营核心修改 1：双击单个引脚（SCH_PIN_T）时，不再提升为父级符号弹窗，
+    // 而是直接为该引脚生成/修改一体化的延长线与网络标签！
+    if( selection.GetSize() == 1 && curr_item->Type() == SCH_PIN_T )
     {
-        EDA_ITEM* parent = curr_item->GetParent();
+        editOrAddIntegratedPinWireLabel( m_frame, m_toolMgr, static_cast<SCH_PIN*>( curr_item ), nullptr, nullptr );
 
-        if( parent->Type() == SCH_SYMBOL_T )
-            curr_item = parent;
+        if( clearSelection )
+            m_toolMgr->RunAction( ACTIONS::selectionClear );
+
+        return 0;
+    }
+
+    // 🌟 蓝兔智营核心修改 2：如果双击的是芯片框内的引脚名称（如 VSS）或引脚号（如 1H13），
+    // 即使选择器选中了 SCH_SYMBOL_T，只要鼠标落在引脚区域内，也执行添加/修改引脚网络标签！
+    if( selection.GetSize() == 1 && curr_item->Type() == SCH_SYMBOL_T )
+    {
+        if( SCH_PIN* hitPin = findHoveredPin() )
+        {
+            editOrAddIntegratedPinWireLabel( m_frame, m_toolMgr, hitPin, nullptr, nullptr );
+
+            if( clearSelection )
+                m_toolMgr->RunAction( ACTIONS::selectionClear );
+
+            return 0;
+        }
     }
 
     switch( curr_item->Type() )
@@ -2857,6 +3329,15 @@ int SCH_EDIT_TOOL::Properties( const TOOL_EVENT& aEvent )
     case SCH_LINE_T:
     case SCH_BUS_WIRE_ENTRY_T:
     case SCH_JUNCTION_T:
+        // 🌟 蓝兔智营核心修改 3：双击单根导线（如引脚延长线）时，不再弹出「连线 & 总线属性」，
+        // 而是直接为该导线添加或修改一体化的网络标签！
+        if( selection.GetSize() == 1 && curr_item->Type() == SCH_LINE_T
+            && static_cast<SCH_LINE*>( curr_item )->IsWire() )
+        {
+            editOrAddIntegratedPinWireLabel( m_frame, m_toolMgr, nullptr, static_cast<SCH_LINE*>( curr_item ), nullptr );
+            break;
+        }
+
         if( SELECTION_CONDITIONS::OnlyTypes( { SCH_ITEM_LOCATE_GRAPHIC_LINE_T } )( selection ) )
         {
             std::deque<SCH_LINE*> lines;
@@ -2880,9 +3361,9 @@ int SCH_EDIT_TOOL::Properties( const TOOL_EVENT& aEvent )
             dlg.ShowModal();
         }
         else if( SELECTION_CONDITIONS::OnlyTypes( { SCH_ITEM_LOCATE_WIRE_T,
-                                                    SCH_ITEM_LOCATE_BUS_T,
-                                                    SCH_BUS_WIRE_ENTRY_T,
-                                                    SCH_JUNCTION_T } )( selection ) )
+                                                   SCH_ITEM_LOCATE_BUS_T,
+                                                   SCH_BUS_WIRE_ENTRY_T,
+                                                   SCH_JUNCTION_T } )( selection ) )
         {
             std::deque<SCH_ITEM*> items;
 
@@ -2921,7 +3402,6 @@ int SCH_EDIT_TOOL::Properties( const TOOL_EVENT& aEvent )
 
             DIALOG_TABLECELL_PROPERTIES dlg( m_frame, cells );
 
-            // QuasiModal required for syntax help and Scintilla auto-complete
             dlg.ShowQuasiModal();
 
             if( dlg.GetReturnValue() == DIALOG_TABLECELL_PROPERTIES::TABLECELL_PROPS_EDIT_TABLE )
@@ -2977,15 +3457,8 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
         int         retval;
         SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( aItem );
 
-        // This needs to be scoped so the dialog destructor removes blocking status
-        // before we launch the next dialog.
         {
             DIALOG_SYMBOL_PROPERTIES symbolPropsDialog( m_frame, symbol );
-
-            // This dialog itself subsequently can invoke a KIWAY_PLAYER as a quasimodal
-            // frame. Therefore this dialog as a modal frame parent, MUST be run under
-            // quasimodal mode for the quasimodal frame support to work.  So don't use
-            // the QUASIMODAL macros here.
             retval = symbolPropsDialog.ShowQuasiModal();
         }
 
@@ -3010,7 +3483,6 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
                 if( wxWindow* blocking_win = editor->Kiway().GetBlockingDialog() )
                     blocking_win->Close( true );
 
-                // The broken library symbol link indicator cannot be edited.
                 if( symbol->IsMissingLibSymbol() )
                     return;
 
@@ -3063,9 +3535,6 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
         bool       okPressed = false;
         bool       updateHierarchyNavigator = false;
 
-        // Keep track of existing sheet paths. EditSheet() can modify this list.
-        // Note that we use the validity checking/repairing version here just to make sure
-        // we've got a valid hierarchy to begin with.
         SCH_SHEET_LIST originalHierarchy;
         originalHierarchy.BuildSheetList( &m_frame->Schematic().Root(), true );
 
@@ -3082,7 +3551,6 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
             }
             else
             {
-                // The sheet file change invalidated the undo/redo list.
                 m_frame->ClearUndoRedoList();
 
                 std::vector<SCH_ITEM*> items;
@@ -3096,19 +3564,10 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
             }
         }
 
-        // If the sheet file is changed and new sheet contents are loaded then we have to
-        // clear the annotations on the new content (as it may have been set from some other
-        // sheet path reference)
         if( doClearAnnotation )
         {
             SCH_SCREENS screensList( &m_frame->Schematic().Root() );
-
-            // We clear annotation of new sheet paths here:
             screensList.ClearAnnotationOfNewSheetPaths( originalHierarchy );
-
-            // Clear annotation of g_CurrentSheet itself, because its sheetpath is not a new
-            // path, but symbols managed by its sheet path must have their annotation cleared
-            // because they are new:
             sheet->GetScreen()->ClearAnnotation( &m_frame->GetCurrentSheet(), false );
         }
 
@@ -3126,7 +3585,6 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
         SCH_SHEET_PIN*              pin = static_cast<SCH_SHEET_PIN*>( aItem );
         DIALOG_SHEET_PIN_PROPERTIES dlg( m_frame, pin );
 
-        // QuasiModal required for help dialog
         dlg.ShowQuasiModal();
         break;
     }
@@ -3136,7 +3594,6 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
     {
         DIALOG_TEXT_PROPERTIES dlg( m_frame, static_cast<SCH_ITEM*>( aItem ) );
 
-        // QuasiModal required for syntax help and Scintilla auto-complete
         dlg.ShowQuasiModal();
         break;
     }
@@ -3145,7 +3602,6 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
     {
         DIALOG_TABLE_PROPERTIES dlg( m_frame, static_cast<SCH_TABLE*>( aItem ) );
 
-        // QuasiModal required for Scintilla auto-complete
         dlg.ShowQuasiModal();
         break;
     }
@@ -3153,11 +3609,17 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
     case SCH_LABEL_T:
     case SCH_GLOBAL_LABEL_T:
     case SCH_HIER_LABEL_T:
+    {
+        // 🌟 蓝兔智营修改：双击标签文字时，同样走一体化引擎（改名同时自动伸缩底部的引脚延长线）
+        editOrAddIntegratedPinWireLabel( m_frame, m_toolMgr, nullptr, nullptr,
+                                         static_cast<SCH_LABEL_BASE*>( aItem ) );
+        break;
+    }
+
     case SCH_DIRECTIVE_LABEL_T:
     {
         DIALOG_LABEL_PROPERTIES dlg( m_frame, static_cast<SCH_LABEL_BASE*>( aItem ), false );
 
-        // QuasiModal for syntax help and Scintilla auto-complete
         dlg.ShowQuasiModal();
         break;
     }
@@ -3189,7 +3651,6 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
 
         if( dlg.ShowModal() == wxID_OK )
         {
-            // The bitmap is cached in Opengl: clear the cache in case it has become invalid
             getView()->RecacheAllItems();
         }
 
@@ -3206,20 +3667,28 @@ void SCH_EDIT_TOOL::EditProperties( EDA_ITEM* aItem )
     }
 
     case SCH_NO_CONNECT_T:
-    case SCH_PIN_T:
         break;
+
+    case SCH_PIN_T:
+    {
+        editOrAddIntegratedPinWireLabel( m_frame, m_toolMgr, static_cast<SCH_PIN*>( aItem ), nullptr, nullptr );
+        break;
+    }
 
     case SCH_GROUP_T:
         m_toolMgr->RunAction( ACTIONS::groupProperties, static_cast<EDA_GROUP*>( static_cast<SCH_GROUP*>( aItem ) ) );
 
         break;
 
-    default: // Unexpected item
+    default:
         wxFAIL_MSG( wxString( "Cannot edit schematic item type " ) + aItem->GetClass() );
     }
 
     updateItem( aItem, true );
 }
+
+
+
 
 
 int SCH_EDIT_TOOL::ChangeTextType( const TOOL_EVENT& aEvent )

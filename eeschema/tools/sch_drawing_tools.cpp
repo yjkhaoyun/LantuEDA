@@ -46,6 +46,7 @@
 #include <view/view_controls.h>
 #include <view/view.h>
 #include <sch_symbol.h>
+#include <sch_pin.h> // 🌟 新增：用于识别引脚末端及读取引脚名称
 #include <sch_no_connect.h>
 #include <sch_group.h>
 #include <sch_line.h>
@@ -166,7 +167,7 @@ public:
             Bind( wxEVT_WEBVIEW_NEWWINDOW, &DIALOG_LANTU_MALL::OnNewWindow, this );
 
             // 跳转到真实地址
-            m_webView->LoadURL( wxS("http://localhost:3000/search?action=select_symbol") );
+            m_webView->LoadURL( wxS("https://lantubom.com/search?action=select_symbol") );
         }
         SetSizer( sizer );
         Center();
@@ -1827,13 +1828,58 @@ bool SCH_DRAWING_TOOLS::createNewLabel( const VECTOR2I& aPosition, int aType,
     SCH_GLOBALLABEL*    globalLabel = nullptr;
     wxString            netName;
 
+    // 辅助函数：如果点击的导线连在某个引脚上，自动继承该引脚名
+    auto findConnectedPinName = [&]( SCH_LINE* aWire ) -> wxString
+    {
+        if( !aWire )
+            return wxEmptyString;
+
+        const SCH_SHEET_PATH& sheetPath = m_frame->GetCurrentSheet();
+
+        for( EDA_ITEM* symItem : m_frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+
+            for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
+            {
+                if( pin->GetPosition() == aWire->GetStartPoint() || pin->GetPosition() == aWire->GetEndPoint() )
+                {
+                    wxString pName = pin->GetName();
+
+                    if( pName.IsEmpty() || pName == wxS( "~" ) )
+                        pName = wxS( "NET_" ) + pin->GetNumber();
+                    else
+                    {
+                        pName.Replace( wxS( "~{" ), wxS( "" ) );
+                        pName.Replace( wxS( "}" ), wxS( "" ) );
+                        pName.Replace( wxS( "~" ), wxS( "" ) );
+                        pName.Replace( wxS( " " ), wxS( "_" ) );
+                    }
+
+                    return EscapeString( pName, CTX_NETNAME );
+                }
+            }
+        }
+
+        return wxEmptyString;
+    };
+
     switch( aType )
     {
     case LAYER_LOCLABEL:
         labelItem = new SCH_LABEL( aPosition );
 
         if( SCH_LINE* wire = findWire( aPosition ) )
+        {
             netName = findWireLabelDriverName( wire );
+
+            if( netName.IsEmpty() )
+                netName = findConnectedPinName( wire );
+        }
+
+        // 🌟 嘉立创风格：不弹复杂属性框，默认赋予网络名（后续双击即可直接改名）
+        if( netName.IsEmpty() )
+            netName = wxS( "NET" );
 
         break;
 
@@ -1860,7 +1906,15 @@ bool SCH_DRAWING_TOOLS::createNewLabel( const VECTOR2I& aPosition, int aType,
         labelItem = globalLabel;
 
         if( SCH_LINE* wire = findWire( aPosition ) )
+        {
             netName = findWireLabelDriverName( wire );
+
+            if( netName.IsEmpty() )
+                netName = findConnectedPinName( wire );
+        }
+
+        if( netName.IsEmpty() )
+            netName = wxS( "NET" );
 
         break;
 
@@ -1869,15 +1923,11 @@ bool SCH_DRAWING_TOOLS::createNewLabel( const VECTOR2I& aPosition, int aType,
         return false;
     }
 
-    // The normal parent is the current screen for these labels, set by SCH_SCREEN::Append()
-    // but it is also used during placement for SCH_HIERLABEL before beeing appended
     labelItem->SetParent( m_frame->GetScreen() );
-
     labelItem->SetTextSize( VECTOR2I( settings.m_DefaultTextSize, settings.m_DefaultTextSize ) );
 
     if( aType != LAYER_NETCLASS_REFS )
     {
-        // Must be after SetTextSize()
         labelItem->SetBold( m_lastTextBold );
         labelItem->SetItalic( m_lastTextItalic );
     }
@@ -1887,7 +1937,6 @@ bool SCH_DRAWING_TOOLS::createNewLabel( const VECTOR2I& aPosition, int aType,
 
     if( !netName.IsEmpty() )
     {
-        // Auto-create from attached wire
         labelItem->SetText( netName );
     }
     else
@@ -1896,7 +1945,6 @@ bool SCH_DRAWING_TOOLS::createNewLabel( const VECTOR2I& aPosition, int aType,
 
         dlg.SetLabelList( &aLabelList );
 
-        // QuasiModal required for syntax help and Scintilla auto-complete
         if( dlg.ShowQuasiModal() != wxID_OK )
         {
             dlg.GetFieldsGridTable()->DetachFields();
@@ -1925,7 +1973,7 @@ bool SCH_DRAWING_TOOLS::createNewLabel( const VECTOR2I& aPosition, int aType,
 
     if( aLabelList.empty() )
         aLabelList.push_back( std::unique_ptr<SCH_LABEL_BASE>( labelItem ) );
-    else // DIALOG_LABEL_PROPERTIES already filled in aLabelList; labelItem is extraneous to needs
+    else
         delete labelItem;
 
     return true;
@@ -1998,6 +2046,8 @@ SCH_SHEET_PIN* SCH_DRAWING_TOOLS::createNewSheetPinFromLabel( SCH_SHEET*      aS
 int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
 {
     SCH_ITEM*             item = nullptr;
+    SCH_LINE*             pinExtendWire = nullptr; // 🌟 新增：点击引脚末端时的自动延长线
+    VECTOR2I              pinExtendOrigin;         // 🌟 新增：引脚末端起点坐标
     KIGFX::VIEW_CONTROLS* controls = getViewControls();
     EE_GRID_HELPER        grid( m_toolMgr );
     bool                  ignorePrimePosition = false;
@@ -2021,13 +2071,12 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
 
     GRID_HELPER_GRIDS snapGrid = isText ? GRID_TEXT : GRID_CONNECTABLE;
 
-    // If we have a selected sheet use it, otherwise try to get one under the cursor
     if( isSheetPin )
         sheet = dynamic_cast<SCH_SHEET*>( m_selectionTool->GetSelection().Front() );
 
     m_toolMgr->RunAction( ACTIONS::selectionClear );
 
-    TOOL_EVENT         originalEvent = aEvent;          // This can change out from under us when the event loop runs
+    TOOL_EVENT         originalEvent = aEvent;
     SCOPED_TOOL_PUSHER raii( m_frame, originalEvent );
 
     auto setCursor =
@@ -2051,6 +2100,10 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
             [&]()
             {
                 m_view->ClearPreview();
+
+                if( pinExtendWire && !pinExtendWire->IsNull() )
+                    m_view->AddToPreview( pinExtendWire->Clone() );
+
                 m_view->AddToPreview( item, false );
                 item->RunOnChildren( [&]( SCH_ITEM* aChild )
                                      {
@@ -2065,6 +2118,8 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
             {
                 m_toolMgr->RunAction( ACTIONS::selectionClear );
                 m_view->ClearPreview();
+                delete pinExtendWire;
+                pinExtendWire = nullptr;
                 delete item;
                 item = nullptr;
 
@@ -2076,10 +2131,7 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
             [&]( SCH_ITEM* aItem, const VECTOR2I& cursorPos )
             {
                 item->SetPosition( cursorPos );
-
                 item->SetFlags( IS_NEW | IS_MOVING );
-
-                // Not placed yet, so pass a nullptr screen reference
                 item->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
 
                 updatePreview();
@@ -2087,24 +2139,88 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 m_selectionTool->AddItemToSel( item );
                 m_toolMgr->PostAction( ACTIONS::refreshPreview );
 
-                // update the cursor so it looks correct before another event
                 setCursor();
             };
 
+    // 🌟 新增辅助函数：查找鼠标点击位置处的元器件引脚 (SCH_PIN)
+    auto findPinAt =
+            [&]( const VECTOR2I& aPos ) -> SCH_PIN*
+            {
+                const SCH_SHEET_PATH& sheetPath = m_frame->GetCurrentSheet();
+
+                for( EDA_ITEM* symItem : m_frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+                {
+                    SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+
+                    for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
+                    {
+                        if( pin->GetPosition() == aPos )
+                            return pin;
+                    }
+                }
+
+                return nullptr;
+            };
+
+    // 🌟 新增辅助函数：将当前正在拖动的延长线+标签落盘提交
+    auto commitCurrentPlacement =
+            [&]( SCH_COMMIT& aCommit )
+            {
+                if( !item )
+                    return;
+
+                if( pinExtendWire )
+                {
+                    if( !pinExtendWire->IsNull() )
+                    {
+                        pinExtendWire->ClearFlags( IS_NEW | IS_MOVING );
+                        m_frame->AddToScreen( pinExtendWire, m_frame->GetScreen() );
+                        aCommit.Added( pinExtendWire, m_frame->GetScreen() );
+                    }
+                    else
+                    {
+                        delete pinExtendWire;
+                    }
+
+                    pinExtendWire = nullptr;
+                }
+
+                item->ClearFlags( IS_MOVING );
+
+                if( item->IsConnectable() && !isNetLabel && !isGlobalLabel )
+                    m_frame->AutoRotateItem( m_frame->GetScreen(), item );
+
+                if( isSheetPin && sheet )
+                {
+                    aCommit.Modify( sheet, m_frame->GetScreen() );
+                    sheet->AddPin( (SCH_SHEET_PIN*) item );
+                }
+                else
+                {
+                    m_frame->SaveCopyForRepeatItem( item );
+                    m_frame->AddToScreen( item, m_frame->GetScreen() );
+                    aCommit.Added( item, m_frame->GetScreen() );
+                }
+
+                item->AutoplaceFields( m_frame->GetScreen(), AUTOPLACE_AUTO );
+                m_frame->Schematic().CleanUp( &aCommit );
+                aCommit.Push( description );
+                m_view->ClearPreview();
+                item = nullptr;
+            };
+
     Activate();
-
-    // Must be done after Activate() so that it gets set into the correct context
     controls->ShowCursor( true );
-
-    // Set initial cursor
     setCursor();
 
-    if( aEvent.HasPosition() )
+    // 🌟 核心修改：对于网络标签(isNetLabel)和全局标签(isGlobalLabel)，
+    // 启动工具时不立即触发 PrimeTool 弹窗，而是等待用户去点引脚末端或导线
+    if( aEvent.HasPosition() && !isNetLabel && !isGlobalLabel )
     {
         m_toolMgr->PrimeTool( aEvent.Position() );
     }
     else if( common_settings->m_Input.immediate_actions && !aEvent.IsReactivate()
-                && ( isText || isGlobalLabel || isHierLabel || isClassLabel || isNetLabel ) )
+                && ( isText || isHierLabel || isClassLabel ) )
     {
         m_toolMgr->PrimeTool( { 0, 0 } );
         ignorePrimePosition = true;
@@ -2123,7 +2239,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
         cursorPos = grid.ResolveSnap( cursorPos, snapGrid, item ).position;
         controls->ForceCursorPosition( true, cursorPos );
 
-        // The tool hotkey is interpreted as a click when drawing
         bool isSyntheticClick = item && evt->IsActivate() && evt->HasPosition() && evt->Matches( aEvent );
 
         if( evt->IsCancelInteractive() || evt->IsAction( &ACTIONS::undo ) )
@@ -2139,7 +2254,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
         {
             if( item && evt->IsMoveTool() )
             {
-                // we're already moving our own item; ignore the move tool
                 evt->SetPassEvent( false );
                 continue;
             }
@@ -2152,28 +2266,82 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
             }
 
             if( evt->IsPointEditor() )
-            {
-                // don't exit (the point editor runs in the background)
                 continue;
-            }
 
             if( evt->IsMoveTool() )
-            {
-                // Make sure we come back after the move tool runs
                 frame()->PushTool( originalEvent );
-            }
 
             break;
         }
         else if( evt->IsClick( BUT_LEFT ) || evt->IsDblClick( BUT_LEFT )
-                || isSyntheticClick
-                || evt->IsAction( &ACTIONS::cursorClick ) || evt->IsAction( &ACTIONS::cursorDblClick ) )
+                 || isSyntheticClick
+                 || evt->IsAction( &ACTIONS::cursorClick ) || evt->IsAction( &ACTIONS::cursorDblClick ) )
         {
         PLACE_NEXT:
-            // First click creates...
+            // 第一次点击：如果点在引脚末端，开启“延长线 + 同名标签”跟随模式
             if( !item )
             {
                 m_toolMgr->RunAction( ACTIONS::selectionClear );
+
+                if( ( isNetLabel || isGlobalLabel ) && findPinAt( cursorPos ) != nullptr )
+                {
+                    SCH_PIN* hitPin = findPinAt( cursorPos );
+                    VECTOR2I pinPos = hitPin->GetPosition();
+
+                    wxString autoNetName = hitPin->GetName();
+
+                    if( autoNetName.IsEmpty() || autoNetName == wxS( "~" ) )
+                        autoNetName = wxS( "NET_" ) + hitPin->GetNumber();
+                    else
+                    {
+                        autoNetName.Replace( wxS( "~{" ), wxS( "" ) );
+                        autoNetName.Replace( wxS( "}" ), wxS( "" ) );
+                        autoNetName.Replace( wxS( "~" ), wxS( "" ) );
+                        autoNetName.Replace( wxS( " " ), wxS( "_" ) );
+                    }
+
+                    autoNetName = EscapeString( autoNetName, CTX_NETNAME );
+
+                    if( autoNetName.IsEmpty() )
+                        autoNetName = wxS( "NET" );
+
+                    SCHEMATIC*          schematic = getModel<SCHEMATIC>();
+                    SCHEMATIC_SETTINGS& settings  = schematic->Settings();
+                    SCH_LABEL_BASE*     labelItem = nullptr;
+
+                    if( isGlobalLabel )
+                    {
+                        SCH_GLOBALLABEL* gLabel = new SCH_GLOBALLABEL( pinPos, autoNetName );
+                        gLabel->SetShape( m_lastGlobalLabelShape );
+                        gLabel->GetField( FIELD_T::INTERSHEET_REFS )->SetVisible( settings.m_IntersheetRefsShow );
+                        gLabel->SetAutoRotateOnPlacement( m_lastAutoLabelRotateOnPlacement );
+                        labelItem = gLabel;
+                    }
+                    else
+                    {
+                        labelItem = new SCH_LABEL( pinPos, autoNetName );
+                    }
+
+                    labelItem->SetParent( m_frame->GetScreen() );
+                    labelItem->SetTextSize( VECTOR2I( settings.m_DefaultTextSize, settings.m_DefaultTextSize ) );
+                    labelItem->SetBold( m_lastTextBold );
+                    labelItem->SetItalic( m_lastTextItalic );
+                    labelItem->SetSpinStyle( m_lastTextOrientation );
+                    labelItem->SetFlags( IS_NEW | IS_MOVING );
+
+                    // 创建跟随鼠标拉伸的引脚延长线
+                    pinExtendOrigin = pinPos;
+                    pinExtendWire = new SCH_LINE( pinPos, LAYER_WIRE );
+                    pinExtendWire->SetParent( &m_frame->Schematic() );
+                    pinExtendWire->SetStartPoint( pinPos );
+                    pinExtendWire->SetEndPoint( pinPos );
+                    pinExtendWire->SetFlags( IS_NEW | IS_MOVING );
+
+                    item = labelItem;
+                    description = _( "Add Label" );
+                    prepItemForPlacement( item, pinPos );
+                    continue;
+                }
 
                 if( isText )
                 {
@@ -2225,7 +2393,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 {
                     EDA_ITEM* i = nullptr;
 
-                    // If we didn't have a sheet selected, try to find one under the cursor
                     if( !sheet && m_selectionTool->SelectPoint( cursorPos, { SCH_SHEET_T }, &i ) )
                         sheet = dynamic_cast<SCH_SHEET*>( i );
 
@@ -2239,7 +2406,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                     }
                     else
                     {
-                        // User is using the 'Sync Sheet Pins' tool
                         if( m_dialogSyncSheetPin && m_dialogSyncSheetPin->GetPlacementTemplate() )
                         {
                             item = createNewSheetPinFromLabel( sheet, cursorPos,
@@ -2247,7 +2413,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                         }
                         else
                         {
-                            // User is using the 'Place Sheet Pins' tool
                             SCH_HIERLABEL* label = importHierLabel( sheet );
 
                             if( !label )
@@ -2267,9 +2432,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                     description = _( "Add Sheet Pin" );
                 }
 
-                // If we started with a hotkey which has a position then warp back to that.
-                // Otherwise update to the current mouse position pinned inside the autoscroll
-                // boundaries.
                 if( evt->IsPrime() && !ignorePrimePosition )
                 {
                     cursorPos = grid.Align( evt->Position() );
@@ -2289,43 +2451,28 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 }
 
                 if( item )
+                {
                     prepItemForPlacement( item, cursorPos );
+
+                    // 如果用户直接点在已有导线上，单击直接放置完成
+                    if( ( isNetLabel || isGlobalLabel ) && !evt->IsPrime() )
+                    {
+                        commitCurrentPlacement( commit );
+                        continue;
+                    }
+                }
 
                 if( m_frame->GetMoveWarpsCursor() )
                     controls->SetCursorPosition( cursorPos, false );
 
                 m_toolMgr->PostAction( ACTIONS::refreshPreview );
             }
-            else            // ... and second click places:
+            else            // 第二次点击：完成延长线与标签的放置
             {
-                item->ClearFlags( IS_MOVING );
-
-                if( item->IsConnectable() )
-                    m_frame->AutoRotateItem( m_frame->GetScreen(), item );
-
-                if( isSheetPin && sheet )
-                {
-                    // Sheet pins are owned by their parent sheet.
-                    commit.Modify( sheet, m_frame->GetScreen() );
-                    sheet->AddPin( (SCH_SHEET_PIN*) item );
-                }
-                else
-                {
-                    m_frame->SaveCopyForRepeatItem( item );
-                    m_frame->AddToScreen( item, m_frame->GetScreen() );
-                    commit.Added( item, m_frame->GetScreen() );
-                }
-
-                item->AutoplaceFields( m_frame->GetScreen(), AUTOPLACE_AUTO );
-
-                commit.Push( description );
-
-                m_view->ClearPreview();
+                commitCurrentPlacement( commit );
 
                 if( m_dialogSyncSheetPin && m_dialogSyncSheetPin->GetPlacementTemplate() )
                 {
-                    m_dialogSyncSheetPin->EndPlaceItem( item );
-
                     if( m_dialogSyncSheetPin->CanPlaceMore() )
                     {
                         item = nullptr;
@@ -2336,8 +2483,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                     m_dialogSyncSheetPin->Show( true );
                     break;
                 }
-
-                item = nullptr;
 
                 if( isSheetPin && sheet )
                 {
@@ -2362,17 +2507,28 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 }
             }
         }
+        // 🌟 蓝兔智营修改：嘉立创风格右键直接完成！
+        // 如果正在拖动引脚延长线+标签，按右键直接落盘完成；如果处于空闲状态，按右键直接退出工具
         else if( evt->IsClick( BUT_RIGHT ) )
         {
-            // Warp after context menu only if dragging...
-            if( !item )
-                m_toolMgr->VetoContextMenuMouseWarp();
-
-            m_menu->ShowContextMenu( m_selectionTool->GetSelection() );
+            if( item )
+            {
+                if( pinExtendWire && !pinExtendWire->IsNull() )
+                {
+                    commitCurrentPlacement( commit );
+                }
+                else
+                {
+                    cleanup();
+                }
+            }
+            else
+            {
+                break;
+            }
         }
         else if( item && evt->IsSelectionEvent() )
         {
-            // This happens if our text was replaced out from under us by ConvertTextType()
             SCH_SELECTION& selection = m_selectionTool->GetSelection();
 
             if( selection.GetSize() == 1 )
@@ -2393,8 +2549,8 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 m_toolMgr->RunSynchronousAction( ACTIONS::increment, &commit, ACTIONS::INCREMENT { 1, 0 } );
         }
         else if( evt->IsAction( &ACTIONS::duplicate )
-                || evt->IsAction( &SCH_ACTIONS::repeatDrawItem )
-                || evt->IsAction( &ACTIONS::paste ) )
+                 || evt->IsAction( &SCH_ACTIONS::repeatDrawItem )
+                 || evt->IsAction( &ACTIONS::paste ) )
         {
             if( item )
             {
@@ -2402,14 +2558,45 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 continue;
             }
 
-            // Exit.  The duplicate/repeat/paste will run in its own loop.
             evt->SetPassEvent();
             break;
         }
         else if( item && ( evt->IsAction( &ACTIONS::refreshPreview ) || evt->IsMotion() ) )
         {
-            item->CalcEdit( cursorPos );
             m_view->ClearPreview();
+
+            // 🌟 如果处于点击引脚末端延长状态，正交更新延长线与标签朝向
+            if( pinExtendWire )
+            {
+                VECTOR2I delta  = cursorPos - pinExtendOrigin;
+                VECTOR2I extEnd = cursorPos;
+
+                if( std::abs( delta.x ) >= std::abs( delta.y ) )
+                {
+                    extEnd = VECTOR2I( cursorPos.x, pinExtendOrigin.y );
+
+                    if( SCH_LABEL_BASE* lbl = dynamic_cast<SCH_LABEL_BASE*>( item ) )
+                        lbl->SetSpinStyle( delta.x >= 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT );
+                }
+                else
+                {
+                    extEnd = VECTOR2I( pinExtendOrigin.x, cursorPos.y );
+
+                    if( SCH_LABEL_BASE* lbl = dynamic_cast<SCH_LABEL_BASE*>( item ) )
+                        lbl->SetSpinStyle( delta.y >= 0 ? SPIN_STYLE::BOTTOM : SPIN_STYLE::UP );
+                }
+
+                pinExtendWire->SetEndPoint( extEnd );
+                item->SetPosition( extEnd );
+
+                if( !pinExtendWire->IsNull() )
+                    m_view->AddToPreview( pinExtendWire->Clone() );
+            }
+            else
+            {
+                item->CalcEdit( cursorPos );
+            }
+
             m_view->AddToPreview( item->Clone() );
             m_frame->SetMsgPanel( item );
         }
@@ -2421,21 +2608,21 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
         {
             wxBell();
         }
-        else if( item && (   evt->IsAction( &SCH_ACTIONS::toDLabel )
-                          || evt->IsAction( &SCH_ACTIONS::toGLabel )
-                          || evt->IsAction( &SCH_ACTIONS::toHLabel )
-                          || evt->IsAction( &SCH_ACTIONS::toLabel )
-                          || evt->IsAction( &SCH_ACTIONS::toText )
-                          || evt->IsAction( &SCH_ACTIONS::toTextBox ) ) )
+        else if( item && (    evt->IsAction( &SCH_ACTIONS::toDLabel )
+                           || evt->IsAction( &SCH_ACTIONS::toGLabel )
+                           || evt->IsAction( &SCH_ACTIONS::toHLabel )
+                           || evt->IsAction( &SCH_ACTIONS::toLabel )
+                           || evt->IsAction( &SCH_ACTIONS::toText )
+                           || evt->IsAction( &SCH_ACTIONS::toTextBox ) ) )
         {
             wxBell();
         }
-        else if( item && (   evt->IsAction( &SCH_ACTIONS::properties )
-                          || evt->IsAction( &SCH_ACTIONS::autoplaceFields )
-                          || evt->IsAction( &SCH_ACTIONS::rotateCW )
-                          || evt->IsAction( &SCH_ACTIONS::rotateCCW )
-                          || evt->IsAction( &SCH_ACTIONS::mirrorV )
-                          || evt->IsAction( &SCH_ACTIONS::mirrorH ) ) )
+        else if( item && (    evt->IsAction( &SCH_ACTIONS::properties )
+                           || evt->IsAction( &SCH_ACTIONS::autoplaceFields )
+                           || evt->IsAction( &SCH_ACTIONS::rotateCW )
+                           || evt->IsAction( &SCH_ACTIONS::rotateCCW )
+                           || evt->IsAction( &SCH_ACTIONS::mirrorV )
+                           || evt->IsAction( &SCH_ACTIONS::mirrorH ) ) )
         {
             m_toolMgr->PostAction( ACTIONS::refreshPreview );
             evt->SetPassEvent();
@@ -2445,7 +2632,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
             evt->SetPassEvent();
         }
 
-        // Enable autopanning and cursor capture only when there is an item to be placed
         controls->SetAutoPan( item != nullptr );
         controls->CaptureCursor( item != nullptr );
     }

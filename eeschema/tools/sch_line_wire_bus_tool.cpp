@@ -704,16 +704,12 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
             };
 
     Activate();
-    // Must be done after Activate() so that it gets set into the correct context
     controls->ShowCursor( true );
-    // Set initial cursor
     setCursor();
 
-    // Add the new label to the selection so the rotate command operates on it
     if( m_busUnfold.label )
         m_selectionTool->AddItemToSel( m_busUnfold.label, true );
 
-    // Continue the existing wires if we've started (usually by immediate action preference)
     if( !m_wires.empty() )
         segment = m_wires.back();
 
@@ -725,7 +721,6 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
         LINE_MODE currentMode = (LINE_MODE) m_frame->eeconfig()->m_Drawing.line_mode;
         bool      twoSegments = currentMode != LINE_MODE::LINE_MODE_FREE;
 
-        // The tool hotkey is interpreted as a click when drawing
         bool isSyntheticClick = ( segment || m_busUnfold.in_progress ) && evt->IsActivate()
                                 && evt->HasPosition() && evt->Matches( aTool );
 
@@ -749,10 +744,8 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
         VECTOR2I cursorPos = grid.ResolveSnap( eventPosition, gridType, segment ).position;
         controls->ForceCursorPosition( true, cursorPos );
 
-        // Need to handle change in H/V mode while drawing
         if( currentMode != lastMode )
         {
-            // Need to delete extra segment if we have one
             if( segment && currentMode == LINE_MODE::LINE_MODE_FREE && m_wires.size() >= 2 )
             {
                 m_wires.pop_back();
@@ -762,12 +755,10 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
                 segment = m_wires.back();
                 segment->SetEndPoint( cursorPos );
             }
-            // Add a segment so we can move orthogonally/45
             else if( segment && lastMode == LINE_MODE::LINE_MODE_FREE )
             {
                 segment->SetEndPoint( cursorPos );
 
-                // Create a new segment, and chain it after the current segment.
                 segment = static_cast<SCH_LINE*>( segment->Duplicate( true, &aCommit ) );
                 segment->SetFlags( IS_NEW | IS_MOVING );
                 segment->SetStartPoint( cursorPos );
@@ -809,7 +800,6 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
 
             if( evt->IsMoveTool() )
             {
-                // Make sure we come back after the move tool runs
                 m_frame->PushTool( aTool );
             }
 
@@ -835,10 +825,9 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
         // Handle click:
         //
         else if( evt->IsClick( BUT_LEFT )
-                || ( segment && evt->IsDblClick( BUT_LEFT ) )
-                || isSyntheticClick )
+                 || ( segment && evt->IsDblClick( BUT_LEFT ) )
+                 || isSyntheticClick )
         {
-            // First click when unfolding places the label and wire-to-bus entry
             if( m_busUnfold.in_progress && !m_busUnfold.label_placed )
             {
                 wxASSERT( aType == LAYER_WIRE );
@@ -852,12 +841,9 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
             {
                 segment = startSegments( aCommit, aType, VECTOR2D( cursorPos ) );
             }
-            // Create a new segment if we're out of previously-created ones
             else if( !segment->IsNull()
-                     || ( twoSegments && !m_wires[m_wires.size() - 2]->IsNull() ) )
+                      || ( twoSegments && !m_wires[m_wires.size() - 2]->IsNull() ) )
             {
-                // Terminate the command if the end point is on a pin, junction, label, or another
-                // wire or bus.
                 if( screen->IsTerminalPoint( cursorPos, segment->GetLayer() ) )
                 {
                     finishSegments( aCommit );
@@ -872,17 +858,19 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
                 {
                     int placedSegments = 1;
 
-                    // When placing lines with the forty-five degree end, the user is
-                    // targetting the endpoint with the angled portion, so it's more
-                    // intuitive to place both segments at the same time.
-                    if( currentMode == LINE_MODE::LINE_MODE_45 )
-                        placedSegments++;
+                    // 🌟 修复：在 90度/45度 折线模式下，如果两段都不为空，同时锁定两段，
+                    // 确保后续右键完成时能精准剥离未落点的悬空预览线
+                    if( currentMode == LINE_MODE::LINE_MODE_45
+                        || ( twoSegments && !segment->IsNull() && m_wires.size() >= 2
+                             && !m_wires[m_wires.size() - 2]->IsNull() ) )
+                    {
+                        placedSegments = 2;
+                    }
 
                     segment->SetEndPoint( cursorPos );
 
                     for( int i = 0; i < placedSegments; i++ )
                     {
-                        // Create a new segment, and chain it after the current segment.
                         segment = static_cast<SCH_LINE*>( segment->Duplicate( true, &aCommit ) );
                         segment->SetFlags( IS_NEW | IS_MOVING );
                         segment->SetStartPoint( cursorPos );
@@ -914,7 +902,6 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
         {
             m_view->ClearPreview();
 
-            // Update the bus unfold posture based on the mouse movement
             if( m_busUnfold.in_progress && !m_busUnfold.label_placed )
             {
                 VECTOR2I cursor_delta = cursorPos - m_busUnfold.origin;
@@ -923,12 +910,11 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
                 bool flipX = ( cursor_delta.x < 0 );
                 bool flipY = ( cursor_delta.y < 0 );
 
-                // Erase and redraw if necessary
                 if( flipX != m_busUnfold.flipX || flipY != m_busUnfold.flipY )
                 {
                     VECTOR2I size  = entry->GetSize();
-                    int    ySign = flipY ? -1 : 1;
-                    int    xSign = flipX ? -1 : 1;
+                    int      ySign = flipY ? -1 : 1;
+                    int      xSign = flipX ? -1 : 1;
 
                     size.x = std::abs( size.x ) * xSign;
                     size.y = std::abs( size.y ) * ySign;
@@ -941,18 +927,15 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
                     m_wires.front()->SetStartPoint( entry->GetEnd() );
                 }
 
-                // Update the label "ghost" position
                 m_busUnfold.label->SetPosition( cursorPos );
                 m_view->AddToPreview( m_busUnfold.label->Clone() );
 
-                // Ensure segment is non-null at the start of bus unfold
                 if( !segment )
                     segment = m_wires.back();
             }
 
             if( segment )
             {
-                // Coerce the line to vertical/horizontal/45 as necessary
                 if( twoSegments && m_wires.size() >= 2 )
                     computeBreakPoint( { m_wires[m_wires.size() - 2], segment }, cursorPos, currentMode, posture );
                 else
@@ -980,11 +963,11 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
                 m_view->AddToPreview( jct, true );
         }
         else if( evt->IsAction( &SCH_ACTIONS::undoLastSegment )
-                 || evt->IsAction( &ACTIONS::doDelete )
-                 || evt->IsAction( &ACTIONS::undo ) )
+                  || evt->IsAction( &ACTIONS::doDelete )
+                  || evt->IsAction( &ACTIONS::undo ) )
         {
             if( ( currentMode == LINE_MODE::LINE_MODE_FREE && m_wires.size() > 1 )
-                || ( LINE_MODE::LINE_MODE_90 && m_wires.size() > 2 ) )
+                 || ( LINE_MODE::LINE_MODE_90 && m_wires.size() > 2 ) )
             {
                 m_view->ClearPreview();
 
@@ -996,7 +979,6 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
                 cursorPos = segment->GetEndPoint();
                 getViewControls()->WarpMouseCursor( cursorPos, true );
 
-                // Find new bend point for current mode
                 if( twoSegments && m_wires.size() >= 2 )
                     computeBreakPoint( { m_wires[m_wires.size() - 2], segment }, cursorPos, currentMode, posture );
                 else
@@ -1010,7 +992,6 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
             }
             else if( evt->IsAction( &ACTIONS::undo ) )
             {
-                // Dispatch as normal undo event
                 evt->SetPassEvent();
             }
             else
@@ -1022,9 +1003,6 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
         {
             posture = !posture;
 
-            // The 90 degree mode doesn't have a forced posture like
-            // the 45 degree mode and computeBreakPoint maintains existing 90s' postures.
-            // Instead, just swap the 90 angle here.
             if( currentMode == LINE_MODE::LINE_MODE_90 )
             {
                 m_view->ClearPreview();
@@ -1035,8 +1013,8 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
                 VECTOR2I delta2 = line2->GetEndPoint() - line2->GetStartPoint();
                 VECTOR2I delta1 = line1->GetEndPoint() - line1->GetStartPoint();
 
-                line2->SetStartPoint(line2->GetEndPoint() - delta1);
-                line1->SetEndPoint(line1->GetStartPoint() + delta2);
+                line2->SetStartPoint( line2->GetEndPoint() - delta1 );
+                line1->SetEndPoint( line1->GetStartPoint() + delta2 );
 
                 for( SCH_LINE* wire : m_wires )
                 {
@@ -1052,21 +1030,68 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
             }
         }
         //------------------------------------------------------------------------
-        // Handle context menu:
+        // 🌟 蓝兔智营修改：嘉立创风格右键逻辑
+        // 正在拉线时按右键直接完成当前延长线；未拉线时按右键退出画线工具
         //
         else if( evt->IsClick( BUT_RIGHT ) )
         {
-            // Warp after context menu only if dragging...
-            if( !segment )
-                m_toolMgr->VetoContextMenuMouseWarp();
+            if( segment || m_busUnfold.in_progress )
+            {
+                const size_t initialSegCount = twoSegments ? 2 : 1;
 
-            contextMenuPos = cursorPos;
-            m_menu->ShowContextMenu( m_selectionTool->GetSelection() );
+                // 如果用户已经左键点击固定了延长线端点，则剥离末尾跟随鼠标的悬空预览段
+                if( m_wires.size() > initialSegCount )
+                {
+                    size_t toPop = twoSegments ? 2 : 1;
+
+                    while( toPop > 0 && m_wires.size() > 1 )
+                    {
+                        SCH_LINE* tail = m_wires.back();
+                        m_wires.pop_back();
+                        m_selectionTool->RemoveItemFromSel( tail, true );
+                        delete tail;
+                        toPop--;
+                    }
+                }
+
+                bool hasValidWire = false;
+
+                for( SCH_LINE* wire : m_wires )
+                {
+                    if( !wire->IsNull() )
+                    {
+                        hasValidWire = true;
+                        break;
+                    }
+                }
+
+                if( hasValidWire )
+                {
+                    finishSegments( aCommit );
+                    segment = nullptr;
+                    aCommit.Push( _( "Draw Wires" ) );
+
+                    if( aQuitOnDraw )
+                        break;
+                }
+                else
+                {
+                    cleanup();
+
+                    if( aQuitOnDraw )
+                        break;
+                }
+            }
+            else
+            {
+                // 空闲状态按右键直接退出画线模式
+                break;
+            }
         }
         else if( evt->Category() == TC_COMMAND && evt->Action() == TA_CHOICE_MENU_CHOICE )
         {
             if( *evt->GetCommandId() >= ID_POPUP_SCH_UNFOLD_BUS
-                && *evt->GetCommandId() <= ID_POPUP_SCH_UNFOLD_BUS_END )
+                 && *evt->GetCommandId() <= ID_POPUP_SCH_UNFOLD_BUS_END )
             {
                 wxASSERT_MSG( !segment, "Bus unfold event received when already drawing!" );
 
@@ -1075,9 +1100,6 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
                 segment = doUnfoldBus( aCommit, net, contextMenuPos );
             }
         }
-        //------------------------------------------------------------------------
-        // Handle TOOL_ACTION special cases
-        //
         else if( evt->IsAction( &SCH_ACTIONS::rotateCW ) || evt->IsAction( &SCH_ACTIONS::rotateCCW ) )
         {
             if( m_busUnfold.in_progress )
@@ -1101,7 +1123,6 @@ int SCH_LINE_WIRE_BUS_TOOL::doDrawSegments( const TOOL_EVENT& aTool, SCH_COMMIT&
             evt->SetPassEvent();
         }
 
-        // Enable autopanning and cursor capture only when there is a segment to be placed
         controls->SetAutoPan( segment != nullptr );
         controls->CaptureCursor( segment != nullptr );
     }
