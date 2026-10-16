@@ -10,7 +10,7 @@
     Copy-Item -Path "out\build\x64-Release\vcpkg_installed\x64-windows\bin\*" -Destination "out\install\x64-Release\bin\" -Force
 
 
-# 一键打包命令
+# 一键打包命令 Visual Studio的Developer PowerShell中运行
     cmake --build out/build/x64-Release --target install ; cmake --build out/build/x64-Release --target create_installer
 
 # 安装包位于 kicad\out\build\x64-Release\installer_output\
