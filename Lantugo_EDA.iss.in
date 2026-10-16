@@ -3,28 +3,101 @@
 AppName=蓝兔智营 EDA
 AppVersion=1.0.0
 AppPublisher=宁波蓝兔智营科技有限公司
+AppPublisherURL=https://lantueda.com/
 AppCopyright=Copyright (C) 2026 宁波蓝兔智营科技有限公司
 
 ; 默认安装到 C:\Program Files\Lantugo_EDA
 DefaultDirName={autopf}\Lantugo_EDA
 DefaultGroupName=蓝兔智营 EDA
+DisableProgramGroupPage=yes
 
-; 打包输出的路径和文件名
+; 打包输出的路径和文件名（直接对应官网下载文件名 LantuEDA-Setup-x64.exe）
 OutputDir=@CMAKE_BINARY_DIR@\installer_output
-OutputBaseFilename=Lantugo_EDA_v1.0.0_Setup
+OutputBaseFilename=LantuEDA-Setup-x64
+
+; 安装包图标与现代向导样式
+SetupIconFile=D:\c-project\LantuEDA\resources\msw\icon_kicad.ico
+WizardStyle=modern
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 
 ; 启用极限压缩算法 (将几个G的产物压缩到几百兆)
 Compression=lzma2/ultra64
 SolidCompression=yes
 PrivilegesRequired=admin
 
+[Tasks]
+Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加图标："; Flags: checkedonce
+
 [Files]
-; 1. 自动抓取 CMake install 目录下的所有零散文件 (咱们自己编译的产物)
-Source: "@CMAKE_INSTALL_PREFIX@\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 1. 自动抓取 CMake install 目录下的所有零散文件，并剔除庞大的 .pdb/.ilk/.lib/.exp 调试符号文件
+Source: "@CMAKE_INSTALL_PREFIX@\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,*.ilk,*.lib,*.exp"
 
 ; 2. 自动去 vcpkg 仓库抓取所有的第三方图形库/底层引擎 DLL (省去手动复制！)
 Source: "@CMAKE_BINARY_DIR@\vcpkg_installed\x64-windows\bin\*.dll"; DestDir: "{app}\bin"; Flags: ignoreversion
+
 [Icons]
 ; 自动在用户桌面和开始菜单生成快捷方式，直接指向 bin 里面的 kicad.exe
-Name: "{autodesktop}\蓝兔智营 EDA"; Filename: "{app}\bin\kicad.exe"; WorkingDir: "{app}\bin"
-Name: "{group}\蓝兔智营 EDA"; Filename: "{app}\bin\kicad.exe"; WorkingDir: "{app}\bin"
+Name: "{autodesktop}\蓝兔智营 EDA"; Filename: "{app}\bin\kicad.exe"; WorkingDir: "{app}\bin"; IconFilename: "D:\c-project\LantuEDA\resources\msw\icon_kicad.ico"; Tasks: desktopicon
+Name: "{group}\蓝兔智营 EDA"; Filename: "{app}\bin\kicad.exe"; WorkingDir: "{app}\bin"; IconFilename: "D:\c-project\LantuEDA\resources\msw\icon_kicad.ico"
+
+[Run]
+Filename: "{app}\bin\kicad.exe"; Description: "立即运行 蓝兔智营 EDA"; Flags: nowait postinstall skipifsilent
+
+[Messages]
+; ==========================================================
+; 全中文安装向导界面提示语
+; ==========================================================
+SetupAppTitle=安装 - %1
+SetupWindowTitle=安装 - %1
+ButtonNext=下一步(&N) >
+ButtonBack=< 上一步(&B)
+ButtonInstall=安装(&I)
+ButtonOK=确定
+ButtonCancel=取消
+ButtonYes=是(&Y)
+ButtonYesToAll=全部是(&A)
+ButtonNo=否(&N)
+ButtonNoToAll=全部否(&O)
+ButtonFinish=完成(&F)
+ButtonBrowse=浏览(&B)...
+ButtonWizardBrowse=浏览(&R)...
+ButtonNewFolder=新建文件夹(&M)
+ClickNext=请点击“下一步”继续，或点击“取消”退出安装程序。
+BrowseDialogTitle=选择文件夹
+BrowseDialogLabel=请在下面选择一个文件夹，然后点击“确定”。
+NewFolderName=新建文件夹
+
+WelcomeLabel1=欢迎使用 [name] 安装向导
+WelcomeLabel2=本向导将在您的电脑上安装 [name/ver]。%n%n建议您在继续之前关闭所有其他应用程序。
+WizardSelectDir=选择安装位置
+SelectDirDesc=您想将 [name] 安装在什么地方？
+SelectDirLabel3=安装程序会将 [name] 安装在以下文件夹中。
+SelectDirBrowseLabel=若要继续，请点击“下一步”。如果您想选择其他文件夹，请点击“浏览”。
+DiskSpaceMBLabel=至少需要 [mb] MB 的可用磁盘空间。
+
+WizardSelectTasks=选择附加任务
+SelectTasksDesc=您想要执行哪些附加任务？
+SelectTasksLabel2=请选择在安装 [name] 时安装程序需要执行的附加任务，然后点击“下一步”。
+
+WizardReady=准备安装
+ReadyLabel1=安装程序现在已准备开始在您的电脑上安装 [name]。
+ReadyLabel2a=请点击“安装”继续此安装程序；如果您想回顾或更改任何设置，请点击“上一步”。
+ReadyLabel2b=请点击“安装”继续此安装程序。
+ReadyMemoDir=目标安装位置：
+ReadyMemoTasks=附加任务：
+
+WizardInstalling=正在安装
+InstallingLabel=正在您的电脑上安装 [name]，请稍候...
+StatusExtractFiles=正在释放文件...
+StatusCreateIcons=正在创建快捷方式...
+StatusCreateRegistryEntries=正在创建注册表项...
+StatusRollback=正在回滚更改...
+
+FinishedHeadingLabel=[name] 安装向导完成
+FinishedLabelNoIcons=安装程序已在您的电脑上完成 [name] 的安装。
+FinishedLabel=安装程序已在您的电脑上完成 [name] 的安装。您可以通过点击桌面或开始菜单中的快捷方式启动软件。
+ClickFinish=请点击“完成”退出安装向导。
+
+ExitSetupTitle=退出安装程序
+ExitSetupMessage=安装尚未完成。如果现在退出，程序将不会被安装。%n%n您可以稍后再运行安装程序以完成安装。%n%n确定要退出安装程序吗？
