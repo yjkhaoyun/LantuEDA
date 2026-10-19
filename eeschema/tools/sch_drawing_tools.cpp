@@ -239,7 +239,8 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
 
     SCH_SYMBOL* symbol = toolParams.m_Symbol;
 
-    bool placeOneOnly = symbol != nullptr;
+    // 🌟 蓝兔智营修改 1：默认单次放置完成后自动退出工具回到箭头模式
+    bool placeOneOnly = true;
 
     SYMBOL_LIBRARY_FILTER       filter;
     std::vector<PICKED_SYMBOL>* historyList = nullptr;
@@ -391,18 +392,10 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
             m_frame->GetInfoBar()->Dismiss();
 
             if( symbol )
-            {
                 cleanup();
 
-                if( keepSymbol )
-                {
-                    m_toolMgr->PostAction( ACTIONS::cursorClick );
-                }
-            }
-            else
-            {
-                break;
-            }
+            // 🌟 蓝兔智营修改 2：按 ESC 取消时直接 break 彻底退出放置工具，绝不留在后台等待下次左键点击
+            break;
         }
         else if( evt->IsActivate() && !isSyntheticClick )
         {
@@ -443,20 +436,20 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 DIALOG_LANTU_MALL mallDialog( m_frame );
                 int dialogResult = wxID_CANCEL;
 
-                // 🌟 致命修复 1：协程栈弹窗会卡死或失效，必须用 RunMainStack 运行 UI
                 RunMainStack( [&]() {
                     dialogResult = mallDialog.ShowModal();
                 });
 
                 if( dialogResult != wxID_OK || mallDialog.m_selectedLibId.IsEmpty() || mallDialog.m_symbolUrl.IsEmpty() )
                 {
-                    continue; 
+                    // 🌟 蓝兔智营修改 3：直接关闭商城窗口（点右上角 X 或取消）时，立即 break 退出工具！
+                    // 解决关闭窗口后点画布空白处再次弹窗的 Bug
+                    break;
                 }
 
                 m_frame->ShowInfoBarMsg( _( "正在从云端下载模型..." ) );
 
                 wxString safeLibId = mallDialog.m_selectedLibId;
-                // 【规范修复】：全量采用 wxS() 安全包裹替换符
                 safeLibId.Replace(wxS("/"), wxS("_")); 
                 safeLibId.Replace(wxS("\\"), wxS("_"));
 
@@ -467,7 +460,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                     wxRemoveFile(tempFilePath); 
                 }
 
-                // 【规范修复】：剔除引号防止注入，全量使用 wxS
                 wxString safeUrl = mallDialog.m_symbolUrl;
                 safeUrl.Replace(wxS("\""), wxS("")); 
                 
@@ -477,10 +469,10 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 if( curlRes != 0 || !wxFileExists(tempFilePath) || wxFileName::GetSize(tempFilePath) == 0 )
                 {
                     m_frame->ShowInfoBarError( wxString::Format( wxS("❌ 模型下载失败！错误码: %ld"), curlRes ) );
-                    continue;
+                    // 🌟 下载失败也直接 break 退出工具
+                    break;
                 }
 
-                // 🌟 致命修复 3：完美接管内存！解决光标变成十字星和导致崩溃的问题
                 std::unique_ptr<LIB_SYMBOL> safeLibSymbol;
                 try 
                 {
@@ -496,11 +488,8 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                             
                             if( cachedSymbol )
                             {
-                                // SCH_IO 解析出来的 cachedSymbol 属于它内部的缓存。
-                                // 在 pi 销毁前，我们赶紧「深拷贝」一份真正属于我们的内存实例 safeLibSymbol！
                                 safeLibSymbol = std::make_unique<LIB_SYMBOL>( *cachedSymbol );
                                 
-                                // 加前缀虚拟库名，防止 ERC 报错
                                 LIB_ID dynamicLibId;
                                 wxString fullId = wxS("LantuBOM:") + safeLibId;
                                 dynamicLibId.Parse( fullId, false );
@@ -512,13 +501,13 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 catch( ... ) 
                 {
                     m_frame->ShowInfoBarError( _( "❌ 云端模型解析异常！" ) );
-                    continue;
+                    break;
                 }
 
                 if( !safeLibSymbol )
                 {
                     m_frame->ShowInfoBarError( _( "❌ 解析成功但模型为空，该文件可能已损坏！" ) );
-                    continue;
+                    break;
                 }
 
                 m_frame->GetInfoBar()->Dismiss(); 
@@ -526,15 +515,10 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 PICKED_SYMBOL sel;
                 sel.LibId = safeLibSymbol->GetLibId();
                 sel.KeepSymbol = false;
-                
-                // 🌟 核心修复：动态判断是否为巨型多单元芯片（如 RK3566）
-                // 只有大于1时才开启连放，确保U1A, U1B, U1C能一次性放完，不会缺失引脚！
                 sel.PlaceAllUnits = ( safeLibSymbol->GetUnitCount() > 1 );
 
                 keepSymbol = sel.KeepSymbol;
                 placeAllUnits = sel.PlaceAllUnits;
-                
-                // 🌟 保持 true：放置完该元件（单模块一次放完，多模块全套放完）后，自动安全退出。
                 placeOneOnly = true;
 
                 if( evt->IsPrime() && !ignorePrimePosition )
@@ -549,16 +533,12 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                                             GRID_HELPER_GRIDS::GRID_CONNECTABLE );
                 }
 
-                // 直接把深拷贝的对象解引用塞进去，SCH_SYMBOL 内部会完美提取并保存。
                 symbol = new SCH_SYMBOL( *safeLibSymbol, &m_frame->GetCurrentSheet(), sel, cursorPos, &m_frame->Schematic() );
 
-                // 🌟 LantuBOM 核心逻辑：强行改写封装字段，使用 "_" 替代 "|" 防止被系统过滤
                 if ( !mallDialog.m_fpName.IsEmpty() )
                 {
-                    // 【大厂规范】：全量包裹 wxS，避免与 C 窄字符相加导致隐式构造报错（C2248）
                     wxString newFpName = wxS("LantuBOM:") + mallDialog.m_selectedLibId + wxS("_") + mallDialog.m_fpName;
                     
-                    // 【规范修改】：使用官方枚举 FIELD_T::FOOTPRINT 代替魔术数字 2
                     if ( SCH_FIELD* fpField = symbol->GetField( FIELD_T::FOOTPRINT ) )
                     {
                         fpField->SetText( newFpName );
@@ -578,7 +558,6 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
                 }
 
                 setCursor();
-                // 此时完全不需要 delete，safeLibSymbol (unique_ptr) 在 if 块结束时会安全地自我销毁，毫无破绽。
             }
             else
             {
@@ -666,9 +645,11 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         }
         else if( evt->IsClick( BUT_RIGHT ) )
         {
-            if( !symbol )
-                m_toolMgr->VetoContextMenuMouseWarp();
-            m_menu->ShowContextMenu( m_selectionTool->GetSelection() );
+            // 🌟 蓝兔智营修改 4：嘉立创风格右键取消当前悬空元件并直接退回普通箭头模式
+            if( symbol )
+                cleanup();
+
+            break;
         }
         else if( evt->Category() == TC_COMMAND && evt->Action() == TA_CHOICE_MENU_CHOICE )
         {
@@ -715,6 +696,7 @@ int SCH_DRAWING_TOOLS::PlaceSymbol( const TOOL_EVENT& aEvent )
         else if( symbol && evt->IsAction( &ACTIONS::doDelete ) )
         {
             cleanup();
+            break;
         }
         else if( symbol && (   evt->IsAction( &ACTIONS::redo )
                             || evt->IsAction( &SCH_ACTIONS::editWithLibEdit )
