@@ -1072,6 +1072,11 @@ INSPECT_RESULT SCH_LABEL_BASE::Visit( INSPECTOR aInspector, void* testData, cons
 
 void SCH_LABEL_BASE::GetEndPoints( std::vector<DANGLING_END_ITEM>& aItemList )
 {
+    // 🌟 蓝兔智营优化：普通网络标签(SCH_LABEL_T)不终结导线的悬空端点状态，
+    // 确保打上标签的导线末端依然显示悬停小圆圈(Clickable Anchor)，随时可继续拉线连往其他引脚！
+    if( Type() == SCH_LABEL_T )
+        return;
+
     DANGLING_END_ITEM item( LABEL_END, this, GetTextPos() );
     aItemList.push_back( item );
 }
@@ -1150,7 +1155,10 @@ const BOX2I SCH_LABEL_BASE::GetBoundingBox() const
 bool SCH_LABEL_BASE::HitTest( const VECTOR2I& aPosition, int aAccuracy ) const
 {
     BOX2I bbox = GetBodyBoundingBox( nullptr );
-    bbox.Inflate( aAccuracy );
+
+    // 🌟 普通网络标签不向外膨胀碰撞框，防止遮挡下方的导线和短废线点击
+    if( Type() != SCH_LABEL_T )
+        bbox.Inflate( aAccuracy );
 
     if( bbox.Contains( aPosition ) )
         return true;
@@ -1176,65 +1184,16 @@ bool SCH_LABEL_BASE::HitTest( const VECTOR2I& aPosition, int aAccuracy ) const
 
 bool SCH_LABEL_BASE::HitTest( const BOX2I& aRect, bool aContained, int aAccuracy ) const
 {
-    BOX2I rect = aRect;
-
-    rect.Inflate( aAccuracy );
-
-    if( aContained )
-    {
-        return rect.Contains( GetBoundingBox() );
-    }
-    else
-    {
-        if( rect.Intersects( GetBodyBoundingBox( nullptr ) ) )
-            return true;
-
-        for( const SCH_FIELD& field : m_fields )
-        {
-            if( field.IsVisible() )
-            {
-                BOX2I fieldBBox = field.GetBoundingBox();
-
-                if( Type() == SCH_LABEL_T || Type() == SCH_GLOBAL_LABEL_T )
-                    fieldBBox.Offset( GetSchematicTextOffset( nullptr ) );
-
-                if( rect.Intersects( fieldBBox ) )
-                    return true;
-            }
-        }
-
-        return false;
-    }
+    // 🌟 蓝兔智营优化：框选时必须完整包住标签文字本身才选中标签
+    return aRect.Contains( GetBodyBoundingBox( nullptr ) );
 }
 
 
 bool SCH_LABEL_BASE::HitTest( const SHAPE_LINE_CHAIN& aPoly, bool aContained ) const
 {
-    if( aContained )
-    {
-        return KIGEOM::BoxHitTest( aPoly, GetBoundingBox(), aContained );
-    }
-    else
-    {
-        if( KIGEOM::BoxHitTest( aPoly, GetBodyBoundingBox( nullptr ), aContained ) )
-            return true;
-
-        for( const SCH_FIELD& field : m_fields )
-        {
-            if( field.IsVisible() )
-            {
-                BOX2I fieldBBox = field.GetBoundingBox();
-
-                if( Type() == SCH_LABEL_T || Type() == SCH_GLOBAL_LABEL_T )
-                    fieldBBox.Offset( GetSchematicTextOffset( nullptr ) );
-
-                if( KIGEOM::BoxHitTest( aPoly, fieldBBox, aContained ) )
-                    return true;
-            }
-        }
-
-        return false;
-    }
+    // 🌟 蓝兔智营核心修复：KiCad 鼠标框选底层实际调用的是此多边形重载函数！
+    // 强制最后一个参数传 true（必须把标签文字完整包进选框内才选中），彻底解决框选下方废线时误删 bbb 标签的问题！
+    return KIGEOM::BoxHitTest( aPoly, GetBodyBoundingBox( nullptr ), true );
 }
 
 
@@ -1708,7 +1667,7 @@ const BOX2I SCH_LABEL::GetBodyBoundingBox( const RENDER_SETTINGS* aSettings ) co
     }
 
     // Labels have a position point that is outside of the TextBox
-    rect.Merge( GetPosition() );
+    // rect.Merge( GetPosition() );
 
     return rect;
 }

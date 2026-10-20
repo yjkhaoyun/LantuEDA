@@ -2555,6 +2555,7 @@ int SCH_EDIT_TOOL::RepeatDrawItem( const TOOL_EVENT& aEvent )
 int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
 {
     SCH_SCREEN*            screen = m_frame->GetScreen();
+    const SCH_SHEET_PATH&  sheetPath = m_frame->GetCurrentSheet();
 
     m_selectionTool->RequestSelection( SCH_COLLECTOR::DeletableItems );
     m_selectionTool->FilterSelectionForLockedItems();
@@ -2567,7 +2568,46 @@ int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
     if( items.empty() )
         return 0;
 
-    // 🌟 蓝兔智营修改：标签名与引脚延长线是一体的，删除其中一个时自动同步删除另一个
+    // 辅助函数：判断某根导线是否为纯粹的“单端悬空引脚短线”（只有一端接引脚，另一端既没接其他导线也没接其他引脚）
+    auto isPureDanglingPinStub = [&]( SCH_LINE* aWire ) -> bool
+    {
+        if( !aWire || !aWire->IsWire() )
+            return false;
+
+        VECTOR2I p1 = aWire->GetStartPoint();
+        VECTOR2I p2 = aWire->GetEndPoint();
+        bool p1OnPin = false, p2OnPin = false;
+
+        for( EDA_ITEM* symItem : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+            for( SCH_PIN* pin : sym->GetPins( &sheetPath ) )
+            {
+                if( pin->GetPosition() == p1 ) p1OnPin = true;
+                if( pin->GetPosition() == p2 ) p2OnPin = true;
+            }
+        }
+
+        if( p1OnPin == p2OnPin )
+            return false; // 两端都接引脚或两端都没接引脚，不是单端引脚延长线
+
+        VECTOR2I freeEnd = p1OnPin ? p2 : p1;
+
+        // 检查自由端是否连接了任何其他导线
+        for( EDA_ITEM* lineItem : screen->Items().OfType( SCH_LINE_T ) )
+        {
+            SCH_LINE* otherW = static_cast<SCH_LINE*>( lineItem );
+            if( otherW != aWire && otherW->IsWire()
+                && IsPointOnSegment( otherW->GetStartPoint(), otherW->GetEndPoint(), freeEnd ) )
+            {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    // 🌟 蓝兔智营修复：安全处理标签与导线的联动删除，绝不误删主干线上的标签！
     std::vector<EDA_ITEM*> extraIntegratedItems;
 
     for( EDA_ITEM* item : items )
@@ -2589,7 +2629,26 @@ int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
                             && !alg::contains( items, lblItem )
                             && !alg::contains( extraIntegratedItems, lblItem ) )
                         {
-                            extraIntegratedItems.push_back( lblItem );
+                            // 🌟 核心保护：检查画面上是否还有【其他未被选中的导线】依然承载着这个标签！
+                            // 比如只删垂直小废线时，水平主干线仍然经过 bbb 的锚点，此时绝不能删掉 bbb！
+                            bool hasRemainingHostWire = false;
+                            for( EDA_ITEM* otherLineItem : screen->Items().OfType( SCH_LINE_T ) )
+                            {
+                                SCH_LINE* otherWire = static_cast<SCH_LINE*>( otherLineItem );
+                                if( otherWire == wire || !otherWire->IsWire() || alg::contains( items, otherLineItem ) )
+                                    continue;
+
+                                if( IsPointOnSegment( otherWire->GetStartPoint(), otherWire->GetEndPoint(), lbl->GetPosition() ) )
+                                {
+                                    hasRemainingHostWire = true;
+                                    break;
+                                }
+                            }
+
+                            if( !hasRemainingHostWire )
+                            {
+                                extraIntegratedItems.push_back( lblItem );
+                            }
                         }
                     }
                 }
@@ -2603,8 +2662,11 @@ int SCH_EDIT_TOOL::DoDelete( const TOOL_EVENT& aEvent )
             {
                 SCH_LINE* wire = static_cast<SCH_LINE*>( lineItem );
 
+                // 🌟 只有当该导线是纯粹的“单端悬空引脚延长线”时，删标签才连带删线；
+                // 如果导线已经连在电路中，删标签只删文字，绝不破坏电路连线！
                 if( wire->IsWire()
                     && IsPointOnSegment( wire->GetStartPoint(), wire->GetEndPoint(), lbl->GetPosition() )
+                    && isPureDanglingPinStub( wire )
                     && !alg::contains( items, lineItem )
                     && !alg::contains( extraIntegratedItems, lineItem ) )
                 {
@@ -3136,6 +3198,14 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
     const SCH_SHEET_PATH& sheetPath = aFrame->GetCurrentSheet();
     SCHEMATIC_SETTINGS&   settings  = aFrame->Schematic().Settings();
 
+    // 记录用户双击时的鼠标网格位置（用于在长导线上双击时精准放置标签）
+    VECTOR2I clickPos( 0, 0 );
+    if( aFrame->GetCanvas() && aFrame->GetCanvas()->GetViewControls() )
+    {
+        VECTOR2D rawClick = aFrame->GetCanvas()->GetViewControls()->GetMousePosition( false );
+        clickPos = aFrame->GetNearestGridPosition( VECTOR2I( KiROUND( rawClick.x ), KiROUND( rawClick.y ) ) );
+    }
+
     // 1. 如果从标签进来，反查它所属的延长线
     if( aLabel && !aWire )
     {
@@ -3213,7 +3283,35 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
         }
     }
 
-    // 5. 计算默认显示的标签名（已有标签则用原名；无标签则提取引脚名）
+    // 辅助函数：检查导线的某个端点是否已经连到了其他导线或元器件引脚上
+    auto isEndpointConnectedToCircuit = [&]( const VECTOR2I& aEndPt, SCH_LINE* aSelfWire, SCH_PIN* aSelfPin ) -> bool
+    {
+        // 检查是否连着其他导线（例如图2右侧的垂直导线）
+        for( EDA_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+        {
+            SCH_LINE* otherW = static_cast<SCH_LINE*>( item );
+            if( otherW != aSelfWire && otherW->IsWire()
+                && IsPointOnSegment( otherW->GetStartPoint(), otherW->GetEndPoint(), aEndPt ) )
+            {
+                return true;
+            }
+        }
+
+        // 检查是否连着其他元器件引脚
+        for( EDA_ITEM* symItem : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
+            for( SCH_PIN* p : sym->GetPins( &sheetPath ) )
+            {
+                if( p != aSelfPin && p->GetPosition() == aEndPt )
+                    return true;
+            }
+        }
+
+        return false;
+    };
+
+    // 5. 计算默认显示的标签名
     wxString defaultText;
 
     if( aLabel )
@@ -3256,7 +3354,7 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
 
     SCH_COMMIT commit( aToolMgr );
 
-    // 6. 如果用户清空了输入框，则将已有标签与单端引脚延长线一并删除
+    // 6. 如果用户清空了输入框：删除标签；仅当导线是纯粹的单端悬空短线时才删除导线
     if( newText.IsEmpty() )
     {
         if( aLabel )
@@ -3267,8 +3365,13 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
 
         if( aWire && aPin )
         {
-            commit.Remove( aWire, screen );
-            aFrame->RemoveFromScreen( aWire, screen );
+            VECTOR2I pinPos = aPin->GetPosition();
+            VECTOR2I otherEnd = ( aWire->GetStartPoint() == pinPos ) ? aWire->GetEndPoint() : aWire->GetStartPoint();
+            if( !isEndpointConnectedToCircuit( otherEnd, aWire, aPin ) )
+            {
+                commit.Remove( aWire, screen );
+                aFrame->RemoveFromScreen( aWire, screen );
+            }
         }
 
         if( !commit.Empty() )
@@ -3284,7 +3387,7 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
 
     wxString escapedText = EscapeString( newText, CTX_NETNAME );
 
-    // 7. 计算引脚朝外延伸的精确方向向量 dir
+    // 7. 计算引脚朝外延伸的方向向量 dir
     VECTOR2I dir( -1, 0 );
 
     if( aPin )
@@ -3313,7 +3416,7 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
         }
     }
 
-    // 8. 准备标签对象并计算文字物理宽度，以便让延长线长度与标签文字完美一体匹配
+    // 8. 准备标签对象并计算文字物理宽度
     bool isNewLabel = ( aLabel == nullptr );
 
     if( isNewLabel )
@@ -3334,11 +3437,14 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
     int       stubLen  = std::max( schIUScale.MilsToIU( 300 ),
                                    ( ( rawLen + gridStep - 1 ) / gridStep ) * gridStep );
 
-    // 9. 如果关联了引脚：自动创建或伸缩引脚延长线，并将标签锚定在延长线外端、文字贴在延长线上方
+    // 9. 如果关联了引脚：智能区分“悬空引脚短线”与“已连入电路的长导线”
     if( aPin )
     {
-        VECTOR2I pinPos  = aPin->GetPosition();
-        VECTOR2I wireEnd = pinPos + dir * stubLen;
+        VECTOR2I pinPos   = aPin->GetPosition();
+        // 🌟 标签锚点设在 stubLen 处，而新建/伸长的悬空导线末端再多往外延伸 1 格 (gridStep = 50mil)，
+        // 让导线最外端始终露出 50mil 纯净悬空线头，鼠标移上去 100% 出现小圆圈可继续拉线！
+        VECTOR2I labelPos = pinPos + dir * stubLen;
+        VECTOR2I wireEnd  = labelPos + dir * gridStep;
 
         if( !aWire )
         {
@@ -3351,42 +3457,49 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
         }
         else
         {
-            // 检查延长线另一端是否悬空（未连接其他元器件引脚）
             VECTOR2I oldOtherEnd = ( aWire->GetStartPoint() == pinPos ) ? aWire->GetEndPoint() : aWire->GetStartPoint();
-            bool     otherEndConnectedToPin = false;
+            bool     otherEndConnected = isEndpointConnectedToCircuit( oldOtherEnd, aWire, aPin );
+            int      currentLen = std::max( std::abs( oldOtherEnd.x - pinPos.x ), std::abs( oldOtherEnd.y - pinPos.y ) );
 
-            for( EDA_ITEM* symItem : screen->Items().OfType( SCH_SYMBOL_T ) )
+            if( !otherEndConnected )
             {
-                SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( symItem );
-
-                for( SCH_PIN* p : sym->GetPins( &sheetPath ) )
+                // 🌟 仅当另一端完全悬空（没接其他导线也没接其他引脚）时：
+                // 如果当前导线比所需长度短，才自动拉长导线；如果用户已经画了更长的线，则保留原线长！
+                int targetWireLen = stubLen + gridStep;
+                if( currentLen < targetWireLen )
                 {
-                    if( p != aPin && p->GetPosition() == oldOtherEnd )
-                    {
-                        otherEndConnectedToPin = true;
-                        break;
-                    }
+                    commit.Modify( aWire, screen );
+                    aWire->SetStartPoint( pinPos );
+                    aWire->SetEndPoint( wireEnd );
+                    aFrame->UpdateItem( aWire, false, true );
                 }
-
-                if( otherEndConnectedToPin )
-                    break;
-            }
-
-            if( !otherEndConnectedToPin )
-            {
-                commit.Modify( aWire, screen );
-                aWire->SetStartPoint( pinPos );
-                aWire->SetEndPoint( wireEnd );
-                aFrame->UpdateItem( aWire, false, true );
+                else
+                {
+                    // 用户手动拉长的悬空线：标签放在距离悬空末端内缩 1 格的位置，露出末端小圆圈
+                    labelPos = oldOtherEnd - dir * gridStep;
+                }
             }
             else
             {
-                wireEnd = ( pinPos + oldOtherEnd ) / 2;
-                wireEnd = aFrame->GetNearestGridPosition( wireEnd );
+                // 🌟 另一端已经连接了其他导线（如图2的右侧垂直线）或其他引脚：
+                // 绝不修改 aWire 的端点（防止断线）！
+                // 如果是新加标签且双击位置在这根导线上，优先放在鼠标双击的位置附近
+                if( !isNewLabel )
+                {
+                    labelPos = aLabel->GetPosition();
+                }
+                else if( currentLen > stubLen )
+                {
+                    labelPos = pinPos + dir * stubLen;
+                }
+                else
+                {
+                    labelPos = aFrame->GetNearestGridPosition( ( pinPos + oldOtherEnd ) / 2 );
+                }
             }
         }
 
-        // 设置标签朝向：锚点在 wireEnd，文字沿着延长线朝向芯片引脚方向铺开（线字一体）
+        // 设置标签朝向：文字朝向芯片引脚方向铺开，绝不遮挡外侧线头小圆圈
         if( dir.x < 0 )
             aLabel->SetSpinStyle( SPIN_STYLE::RIGHT );
         else if( dir.x > 0 )
@@ -3396,14 +3509,17 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
         else
             aLabel->SetSpinStyle( SPIN_STYLE::UP );
 
-        aLabel->SetPosition( wireEnd );
+        aLabel->SetPosition( labelPos );
     }
     else if( aWire )
     {
-        // 普通独立导线（未直接接触引脚）：将标签放在导线中点或端点上方
+        // 普通独立导线（未直接接触引脚）：绝不改变导线长度，将新标签放在鼠标双击处或导线中点
         VECTOR2I startPt = aWire->GetStartPoint();
         VECTOR2I endPt   = aWire->GetEndPoint();
-        VECTOR2I midPt   = aFrame->GetNearestGridPosition( ( startPt + endPt ) / 2 );
+        VECTOR2I placePt = aFrame->GetNearestGridPosition( ( startPt + endPt ) / 2 );
+
+        if( IsPointOnSegment( startPt, endPt, clickPos ) && clickPos != startPt && clickPos != endPt )
+            placePt = clickPos;
 
         if( std::abs( endPt.x - startPt.x ) >= std::abs( endPt.y - startPt.y ) )
             aLabel->SetSpinStyle( SPIN_STYLE::RIGHT );
@@ -3411,7 +3527,7 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
             aLabel->SetSpinStyle( SPIN_STYLE::UP );
 
         if( isNewLabel )
-            aLabel->SetPosition( midPt );
+            aLabel->SetPosition( placePt );
     }
 
     aLabel->AutoplaceFields( screen, AUTOPLACE_AUTO );
@@ -3429,7 +3545,7 @@ static void editOrAddIntegratedPinWireLabel( SCH_EDIT_FRAME* aFrame, TOOL_MANAGE
     aFrame->Schematic().CleanUp( &commit );
     aFrame->TestDanglingEnds();
     aFrame->OnModify();
-    aToolMgr->RunAction( ACTIONS::selectionClear ); // 🌟 新增：清除双击时留下的淡蓝色选中框
+    aToolMgr->RunAction( ACTIONS::selectionClear );
     aFrame->GetCanvas()->Refresh();
 
     commit.Push( isNewLabel ? _( "Add Pin Net Label" ) : _( "Edit Pin Net Label" ) );

@@ -4410,13 +4410,19 @@ SCH_SYMBOL& SCH_SYMBOL::operator=( const SCH_SYMBOL& aSymbol )
 
 bool SCH_SYMBOL::HitTest( const VECTOR2I& aPosition, int aAccuracy ) const
 {
-    BOX2I bBox = GetBodyBoundingBox();
-    bBox.Inflate( aAccuracy / 2 );
+    // 🌟 直接使用包含引脚与本体的外框 (GetBodyAndPinsBoundingBox)，不再屏蔽引脚末端坐标！
+    // 这样鼠标移到引脚末端小圆圈时能正常触发接线拉出导线，放在元器件本体上又能直接选中拖动！
+    BOX2I bBox = GetBodyAndPinsBoundingBox();
 
-    if( bBox.Contains( aPosition ) )
-        return true;
+    const int minGrabSize = schIUScale.MilsToIU( 120 );
+    if( bBox.GetWidth() < minGrabSize )
+        bBox.Inflate( ( minGrabSize - bBox.GetWidth() ) / 2, 0 );
+    if( bBox.GetHeight() < minGrabSize )
+        bBox.Inflate( 0, ( minGrabSize - bBox.GetHeight() ) / 2 );
 
-    return false;
+    bBox.Inflate( aAccuracy + schIUScale.MilsToIU( 20 ) );
+
+    return bBox.Contains( aPosition );
 }
 
 
@@ -4426,13 +4432,12 @@ bool SCH_SYMBOL::HitTest( const BOX2I& aRect, bool aContained, int aAccuracy ) c
         return false;
 
     BOX2I rect = aRect;
-
     rect.Inflate( aAccuracy / 2 );
 
     if( aContained )
-        return rect.Contains( GetBodyBoundingBox() );
+        return rect.Contains( GetBodyAndPinsBoundingBox() );
 
-    return rect.Intersects( GetBodyBoundingBox() );
+    return rect.Intersects( GetBodyAndPinsBoundingBox() );
 }
 
 
@@ -4441,7 +4446,7 @@ bool SCH_SYMBOL::HitTest( const SHAPE_LINE_CHAIN& aPoly, bool aContained ) const
     if( m_flags & STRUCT_DELETED || m_flags & SKIP_STRUCT )
         return false;
 
-    return KIGEOM::BoxHitTest( aPoly, GetBodyBoundingBox(), aContained );
+    return KIGEOM::BoxHitTest( aPoly, GetBodyAndPinsBoundingBox(), aContained );
 }
 
 

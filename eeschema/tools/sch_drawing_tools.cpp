@@ -2028,8 +2028,8 @@ SCH_SHEET_PIN* SCH_DRAWING_TOOLS::createNewSheetPinFromLabel( SCH_SHEET*      aS
 int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
 {
     SCH_ITEM*             item = nullptr;
-    SCH_LINE*             pinExtendWire = nullptr; // 🌟 新增：点击引脚末端时的自动延长线
-    VECTOR2I              pinExtendOrigin;         // 🌟 新增：引脚末端起点坐标
+    SCH_LINE*             pinExtendWire = nullptr; // 🌟 点击引脚末端时的自动延长线
+    VECTOR2I              pinExtendOrigin;         // 🌟 引脚末端起点坐标
     KIGFX::VIEW_CONTROLS* controls = getViewControls();
     EE_GRID_HELPER        grid( m_toolMgr );
     bool                  ignorePrimePosition = false;
@@ -2110,9 +2110,9 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
             };
 
     auto prepItemForPlacement =
-            [&]( SCH_ITEM* aItem, const VECTOR2I& cursorPos )
+            [&]( SCH_ITEM* aItem, const VECTOR2I& aCursorPos )
             {
-                item->SetPosition( cursorPos );
+                item->SetPosition( aCursorPos );
                 item->SetFlags( IS_NEW | IS_MOVING );
                 item->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
 
@@ -2124,7 +2124,7 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 setCursor();
             };
 
-    // 🌟 新增辅助函数：查找鼠标点击位置处的元器件引脚 (SCH_PIN)
+    // 查找鼠标点击位置处的元器件引脚 (SCH_PIN)
     auto findPinAt =
             [&]( const VECTOR2I& aPos ) -> SCH_PIN*
             {
@@ -2144,7 +2144,60 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 return nullptr;
             };
 
-    // 🌟 新增辅助函数：将当前正在拖动的延长线+标签落盘提交
+    // 查找鼠标点击位置处是否已有标签（用于支持双击直接改名）
+    auto findLabelAt =
+            [&]( const VECTOR2I& aPos ) -> SCH_LABEL_BASE*
+            {
+                for( SCH_ITEM* it : m_frame->GetScreen()->Items().Overlapping( aPos ) )
+                {
+                    if( it->IsType( { SCH_LABEL_T, SCH_GLOBAL_LABEL_T, SCH_HIER_LABEL_T } ) )
+                        return static_cast<SCH_LABEL_BASE*>( it );
+                }
+                return nullptr;
+            };
+
+    // 🌟 辅助函数：计算延长线终点与内缩 1 格 (50mil) 的标签挂载点，确保导线最外端始终保留小圆圈！
+    auto calcWireAndLabelPos =
+            [&]( const VECTOR2I& aOrigin, const VECTOR2I& aCursor, VECTOR2I& aOutWireEnd,
+                 VECTOR2I& aOutLabelPos, SPIN_STYLE& aOutSpin )
+            {
+                const int step  = schIUScale.MilsToIU( 50 );
+                VECTOR2I  delta = aCursor - aOrigin;
+
+                if( std::abs( delta.x ) >= std::abs( delta.y ) )
+                {
+                    int dx = delta.x;
+                    // 若拉出距离不足 2 格，自动补足到 2 格 (100mil)，给导线末端留出独立悬空点
+                    if( dx != 0 && std::abs( dx ) < step * 2 )
+                        dx = ( dx > 0 ) ? step * 2 : -step * 2;
+
+                    aOutWireEnd  = VECTOR2I( aOrigin.x + dx, aOrigin.y );
+                    aOutLabelPos = aOutWireEnd;
+
+                    if( std::abs( dx ) >= step * 2 )
+                        aOutLabelPos.x = aOutWireEnd.x - ( dx > 0 ? step : -step );
+
+                    // 🌟 关键修正：往右拉线(dx>0)时文字向左延伸(LEFT)，往左拉线(dx<0)时文字向右延伸(RIGHT)，
+                    // 让文字始终处于导线中间，绝不遮挡最外端的线头小圆圈！
+                    aOutSpin = ( dx >= 0 ) ? SPIN_STYLE::LEFT : SPIN_STYLE::RIGHT;
+                }
+                else
+                {
+                    int dy = delta.y;
+                    if( dy != 0 && std::abs( dy ) < step * 2 )
+                        dy = ( dy > 0 ) ? step * 2 : -step * 2;
+
+                    aOutWireEnd  = VECTOR2I( aOrigin.x, aOrigin.y + dy );
+                    aOutLabelPos = aOutWireEnd;
+
+                    if( std::abs( dy ) >= step * 2 )
+                        aOutLabelPos.y = aOutWireEnd.y - ( dy > 0 ? step : -step );
+
+                    aOutSpin = ( dy >= 0 ) ? SPIN_STYLE::BOTTOM : SPIN_STYLE::UP;
+                }
+            };
+
+    // 将当前正在拖动的延长线+标签落盘提交
     auto commitCurrentPlacement =
             [&]( SCH_COMMIT& aCommit )
             {
@@ -2195,14 +2248,12 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
     controls->ShowCursor( true );
     setCursor();
 
-    // 🌟 核心修改：对于网络标签(isNetLabel)和全局标签(isGlobalLabel)，
-    // 启动工具时不立即触发 PrimeTool 弹窗，而是等待用户去点引脚末端或导线
     if( aEvent.HasPosition() && !isNetLabel && !isGlobalLabel )
     {
         m_toolMgr->PrimeTool( aEvent.Position() );
     }
     else if( common_settings->m_Input.immediate_actions && !aEvent.IsReactivate()
-                && ( isText || isHierLabel || isClassLabel ) )
+               && ( isText || isHierLabel || isClassLabel ) )
     {
         m_toolMgr->PrimeTool( { 0, 0 } );
         ignorePrimePosition = true;
@@ -2210,7 +2261,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
 
     SCH_COMMIT commit( m_toolMgr );
 
-    // Main loop: keep receiving events
     while( TOOL_EVENT* evt = Wait() )
     {
         setCursor();
@@ -2255,17 +2305,27 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
 
             break;
         }
-        else if( evt->IsClick( BUT_LEFT ) || evt->IsDblClick( BUT_LEFT )
-                 || isSyntheticClick
-                 || evt->IsAction( &ACTIONS::cursorClick ) || evt->IsAction( &ACTIONS::cursorDblClick ) )
+        // 🌟 蓝兔智营优化：如果在标签工具下双击已放置的标签，直接弹出属性窗修改标签名称（如改为 bbb），防止截断导线！
+        else if( !item && ( evt->IsDblClick( BUT_LEFT ) || evt->IsAction( &ACTIONS::cursorDblClick ) ) )
+        {
+            if( SCH_LABEL_BASE* existingLabel = findLabelAt( cursorPos ) )
+            {
+                m_selectionTool->ClearSelection( true );
+                m_selectionTool->AddItemToSel( existingLabel );
+                m_toolMgr->RunAction( SCH_ACTIONS::properties );
+                continue;
+            }
+        }
+        else if( evt->IsClick( BUT_LEFT ) || isSyntheticClick || evt->IsAction( &ACTIONS::cursorClick ) )
         {
         PLACE_NEXT:
-            // 第一次点击：如果点在引脚末端，开启“延长线 + 同名标签”跟随模式
             if( !item )
             {
                 m_toolMgr->RunAction( ACTIONS::selectionClear );
 
-                if( ( isNetLabel || isGlobalLabel ) && findPinAt( cursorPos ) != nullptr )
+                // 🌟 核心修复：仅当引脚末端【还没有连接任何导线】(`findWire( cursorPos ) == nullptr`) 时，
+                // 才开启“拉出延长线+标签”模式；如果引脚已经有导线（如图2），直接走下方分支把标签贴在原导线上，绝不断线！
+                if( ( isNetLabel || isGlobalLabel ) && findPinAt( cursorPos ) != nullptr && findWire( cursorPos ) == nullptr )
                 {
                     SCH_PIN* hitPin = findPinAt( cursorPos );
                     VECTOR2I pinPos = hitPin->GetPosition();
@@ -2311,7 +2371,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                     labelItem->SetSpinStyle( m_lastTextOrientation );
                     labelItem->SetFlags( IS_NEW | IS_MOVING );
 
-                    // 创建跟随鼠标拉伸的引脚延长线
                     pinExtendOrigin = pinPos;
                     pinExtendWire = new SCH_LINE( pinPos, LAYER_WIRE );
                     pinExtendWire->SetParent( &m_frame->Schematic() );
@@ -2434,9 +2493,29 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
 
                 if( item )
                 {
-                    prepItemForPlacement( item, cursorPos );
+                    VECTOR2I placePos = cursorPos;
 
-                    // 如果用户直接点在已有导线上，单击直接放置完成
+                    // 🌟 如果用户直接点在已有导线的最末端打标签，自动将标签向导线内部偏移 1 格(50mil)，
+                    // 防止标签锚点覆盖导线末端导致末端小圆圈消失！
+                    if( ( isNetLabel || isGlobalLabel ) )
+                    {
+                        if( SCH_LINE* w = findWire( cursorPos ) )
+                        {
+                            const int step = schIUScale.MilsToIU( 50 );
+                            if( cursorPos == w->GetStartPoint() || cursorPos == w->GetEndPoint() )
+                            {
+                                VECTOR2I otherEnd = ( cursorPos == w->GetStartPoint() ) ? w->GetEndPoint() : w->GetStartPoint();
+                                VECTOR2I diff     = otherEnd - cursorPos;
+                                if( diff.y == 0 && std::abs( diff.x ) >= step * 2 )
+                                    placePos.x += ( diff.x > 0 ? step : -step );
+                                else if( diff.x == 0 && std::abs( diff.y ) >= step * 2 )
+                                    placePos.y += ( diff.y > 0 ? step : -step );
+                            }
+                        }
+                    }
+
+                    prepItemForPlacement( item, placePos );
+
                     if( ( isNetLabel || isGlobalLabel ) && !evt->IsPrime() )
                     {
                         commitCurrentPlacement( commit );
@@ -2449,8 +2528,21 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
 
                 m_toolMgr->PostAction( ACTIONS::refreshPreview );
             }
-            else            // 第二次点击：完成延长线与标签的放置
+            else // 第二次点击：完成延长线与标签的放置
             {
+                if( pinExtendWire )
+                {
+                    VECTOR2I   extEnd, labelPos;
+                    SPIN_STYLE spin = m_lastTextOrientation;
+                    calcWireAndLabelPos( pinExtendOrigin, cursorPos, extEnd, labelPos, spin );
+
+                    pinExtendWire->SetEndPoint( extEnd );
+                    item->SetPosition( labelPos );
+
+                    if( SCH_LABEL_BASE* lbl = dynamic_cast<SCH_LABEL_BASE*>( item ) )
+                        lbl->SetSpinStyle( spin );
+                }
+
                 commitCurrentPlacement( commit );
 
                 if( m_dialogSyncSheetPin && m_dialogSyncSheetPin->GetPlacementTemplate() )
@@ -2489,8 +2581,6 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
                 }
             }
         }
-        // 🌟 蓝兔智营修改：嘉立创风格右键直接完成！
-        // 如果正在拖动引脚延长线+标签，按右键直接落盘完成；如果处于空闲状态，按右键直接退出工具
         else if( evt->IsClick( BUT_RIGHT ) )
         {
             if( item )
@@ -2547,29 +2637,18 @@ int SCH_DRAWING_TOOLS::TwoClickPlace( const TOOL_EVENT& aEvent )
         {
             m_view->ClearPreview();
 
-            // 🌟 如果处于点击引脚末端延长状态，正交更新延长线与标签朝向
+            // 🌟 拖动延长线时：标签锚点自动内缩 1 格，导线最外端始终露出来保持悬空小圆圈！
             if( pinExtendWire )
             {
-                VECTOR2I delta  = cursorPos - pinExtendOrigin;
-                VECTOR2I extEnd = cursorPos;
-
-                if( std::abs( delta.x ) >= std::abs( delta.y ) )
-                {
-                    extEnd = VECTOR2I( cursorPos.x, pinExtendOrigin.y );
-
-                    if( SCH_LABEL_BASE* lbl = dynamic_cast<SCH_LABEL_BASE*>( item ) )
-                        lbl->SetSpinStyle( delta.x >= 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT );
-                }
-                else
-                {
-                    extEnd = VECTOR2I( pinExtendOrigin.x, cursorPos.y );
-
-                    if( SCH_LABEL_BASE* lbl = dynamic_cast<SCH_LABEL_BASE*>( item ) )
-                        lbl->SetSpinStyle( delta.y >= 0 ? SPIN_STYLE::BOTTOM : SPIN_STYLE::UP );
-                }
+                VECTOR2I   extEnd, labelPos;
+                SPIN_STYLE spin = m_lastTextOrientation;
+                calcWireAndLabelPos( pinExtendOrigin, cursorPos, extEnd, labelPos, spin );
 
                 pinExtendWire->SetEndPoint( extEnd );
-                item->SetPosition( extEnd );
+                item->SetPosition( labelPos );
+
+                if( SCH_LABEL_BASE* lbl = dynamic_cast<SCH_LABEL_BASE*>( item ) )
+                    lbl->SetSpinStyle( spin );
 
                 if( !pinExtendWire->IsNull() )
                     m_view->AddToPreview( pinExtendWire->Clone() );
