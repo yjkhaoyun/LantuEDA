@@ -2236,6 +2236,18 @@ void PCB_EDIT_FRAME::OnBoardLoaded()
 
     ReCreateLayerBox();
 
+
+    // 新建空白 PCB 首次加载时，默认关闭 F.Fab / B.Fab 装配层长文字显示
+    if( GetBoard()->IsEmpty() )
+    {
+        LSET visibleLayers = GetBoard()->GetVisibleLayers();
+        visibleLayers.reset( F_Fab );
+        visibleLayers.reset( B_Fab );
+        GetBoard()->SetVisibleLayers( visibleLayers );
+    }
+
+    // Sync layer and item visibility
+    GetCanvas()->SyncLayersVisibility( m_pcb );
     // Sync layer and item visibility
     GetCanvas()->SyncLayersVisibility( m_pcb );
 

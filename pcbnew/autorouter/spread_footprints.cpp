@@ -23,30 +23,81 @@
 
 /**
  * @file spread_footprints.cpp
- * @brief functions to spread footprints on free areas outside a board.
- * this is useful after reading a netlist, when new footprints are loaded and stacked at 0,0 coordinate.
- * Often, spread them on a free area near the board being edited make more easy their selection.
+ * @brief Functions to spread footprints on free areas outside a board without overlapping text.
  */
 
 #include "spread_footprints.h"
 
-#include <optional>
 #include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <tuple>
+#include <vector>
 
 #include <footprint.h>
-#include <refdes_utils.h>
-#include <string_utils.h>
 #include <pcb_edit_frame.h>
 #include <rectpack2d/finders_interface.h>
+#include <refdes_utils.h>
+#include <string_utils.h>
 
 
 constexpr bool allow_flip = true;
 
 using SPACES_T = rectpack2D::empty_spaces<allow_flip, rectpack2D::default_empty_spaces>;
-using RECT_T = rectpack2D::output_rect_t<SPACES_T>;
+using RECT_T   = rectpack2D::output_rect_t<SPACES_T>;
 
 // Use 0.01 mm units to calculate placement, to avoid long calculation time
 const int scale = (int) ( 0.01 * pcbIUScale.IU_PER_MM );
+
+
+namespace
+{
+
+struct SPREAD_GROUP_KEY
+{
+    int bodyWBin  = 0;
+    int bodyHBin  = 0;
+    int fullWTier = 0;
+    int fullHTier = 0;
+
+    bool operator<( const SPREAD_GROUP_KEY& aOther ) const
+    {
+        return std::tie( bodyWBin, bodyHBin, fullWTier, fullHTier )
+               < std::tie( aOther.bodyWBin, aOther.bodyHBin, aOther.fullWTier, aOther.fullHTier );
+    }
+};
+
+
+static VECTOR2I getBoxCenterSafe( const BOX2I& aBox )
+{
+    return VECTOR2I( static_cast<int>( static_cast<int64_t>( aBox.GetX() ) + static_cast<int64_t>( aBox.GetWidth() ) / 2 ),
+                     static_cast<int>( static_cast<int64_t>( aBox.GetY() ) + static_cast<int64_t>( aBox.GetHeight() ) / 2 ) );
+}
+
+
+/**
+ * 获取包含焊盘、丝印框及可见文字（位号 Reference / 数值 Value 等）的完整防撞包围盒
+ */
+static BOX2I getFootprintSafeBBox( const FOOTPRINT* aFootprint )
+{
+    BOX2I bbox     = aFootprint->GetBoundingBox( false );
+    BOX2I textBBox = aFootprint->GetBoundingBox( true );
+
+    if( textBBox.GetWidth() > 0 && textBBox.GetHeight() > 0 )
+    {
+        if( bbox.GetWidth() > 0 || bbox.GetHeight() > 0 )
+            bbox.Merge( textBBox );
+        else
+            bbox = textBBox;
+    }
+
+    return bbox;
+}
+
+} // namespace
 
 
 static bool compareFootprintsbyRef( FOOTPRINT* ref, FOOTPRINT* compare )
@@ -65,8 +116,6 @@ static bool compareFootprintsbyRef( FOOTPRINT* ref, FOOTPRINT* compare )
 
         return refInt < cmpInt;
     }
-
-    return false;
 }
 
 
@@ -78,12 +127,12 @@ std::optional<rectpack2D::rect_wh> spreadRectangles( std::vector<RECT_T>& vecSub
 
     std::optional<rectpack2D::rect_wh> result;
 
-    int max_side = std::max( areaSizeX, areaSizeY );
+    int max_side = std::max<int>( 10, std::max<int>( areaSizeX, areaSizeY ) );
 
     for( int i = 0; i < 2000; i++ )
     {
         bool      anyUnsuccessful = false;
-        const int discard_step = 1;
+        const int discard_step    = 1;
 
         auto report_successful =
                 [&]( RECT_T& )
@@ -92,7 +141,7 @@ std::optional<rectpack2D::rect_wh> spreadRectangles( std::vector<RECT_T>& vecSub
                 };
 
         auto report_unsuccessful =
-                [&]( RECT_T& r )
+                [&]( RECT_T& )
                 {
                     anyUnsuccessful = true;
                     return rectpack2D::callback_result::ABORT_PACKING;
@@ -105,7 +154,7 @@ std::optional<rectpack2D::rect_wh> spreadRectangles( std::vector<RECT_T>& vecSub
 
         if( !result || anyUnsuccessful )
         {
-            max_side = (int) ( max_side * 1.2 );
+            max_side = std::max<int>( max_side + 10, static_cast<int>( max_side * 1.2 ) );
             continue;
         }
 
@@ -119,121 +168,180 @@ std::optional<rectpack2D::rect_wh> spreadRectangles( std::vector<RECT_T>& vecSub
 void SpreadFootprints( std::vector<FOOTPRINT*>* aFootprints, const VECTOR2I& aTargetBoxPosition, bool aGroupBySheet,
                        int aComponentGap, int aGroupGap )
 {
-    using FpBBoxToFootprintsPair = std::pair<BOX2I, std::vector<FOOTPRINT*>>;
-    using SheetBBoxToFootprintsMapPair = std::pair<BOX2I, std::map<VECTOR2I, FpBBoxToFootprintsPair>>;
+    if( !aFootprints || aFootprints->empty() )
+        return;
+
+    // 保障元件及文字外沿至少留有 1.0mm 安全净空，组块之间至少留有 2.2mm 间隔，彻底杜绝压字
+    const int effectiveCompGap  = std::max<int>( aComponentGap, static_cast<int>( pcbIUScale.mmToIU( 1.0 ) ) );
+    const int effectiveBlockGap = std::max<int>( aComponentGap * 2, static_cast<int>( pcbIUScale.mmToIU( 2.2 ) ) );
+    const int effectiveGroupGap = std::max<int>( aGroupGap, static_cast<int>( pcbIUScale.mmToIU( 3.0 ) ) );
+
+    const int bodyQuantStep = std::max<int>( 1, static_cast<int>( pcbIUScale.mmToIU( 0.2 ) ) );
+    const int textWTierStep = std::max<int>( 1, static_cast<int>( pcbIUScale.mmToIU( 4.0 ) ) );
+    const int textHTierStep = std::max<int>( 1, static_cast<int>( pcbIUScale.mmToIU( 3.0 ) ) );
+
+    using FpBBoxToFootprintsPair       = std::pair<BOX2I, std::vector<FOOTPRINT*>>;
+    using SheetBBoxToFootprintsMapPair = std::pair<BOX2I, std::map<SPREAD_GROUP_KEY, FpBBoxToFootprintsPair>>;
 
     std::map<wxString, SheetBBoxToFootprintsMapPair> sheetsMap;
 
-    // Fill in the maps
+    // 1. 按同封装尺寸 + 文字跨度分档归组
     for( FOOTPRINT* footprint : *aFootprints )
     {
+        if( !footprint )
+            continue;
+
         wxString path = aGroupBySheet ? footprint->GetPath().AsString().BeforeLast( '/' ) : wxString( wxS( "" ) );
 
-        VECTOR2I size = footprint->GetBoundingBox( false ).GetSize();
-        size.x += aComponentGap;
-        size.y += aComponentGap;
+        BOX2I bodyBox = footprint->GetBoundingBox( false );
+        BOX2I fullBox = getFootprintSafeBBox( footprint );
 
-        sheetsMap[path].second[size].second.push_back( footprint );
+        SPREAD_GROUP_KEY key;
+        key.bodyWBin  = static_cast<int>( ( static_cast<int64_t>( bodyBox.GetWidth() ) + bodyQuantStep / 2 ) / bodyQuantStep );
+        key.bodyHBin  = static_cast<int>( ( static_cast<int64_t>( bodyBox.GetHeight() ) + bodyQuantStep / 2 ) / bodyQuantStep );
+        key.fullWTier = static_cast<int>( fullBox.GetWidth() / textWTierStep );
+        key.fullHTier = static_cast<int>( fullBox.GetHeight() / textHTierStep );
+
+        sheetsMap[path].second[key].second.push_back( footprint );
     }
 
     for( auto& [sheetPath, sheetPair] : sheetsMap )
     {
-        auto& [sheet_bbox, sizeToFpMap] = sheetPair;
+        auto& [sheet_bbox, groupToFpMap] = sheetPair;
 
-        for( auto& [fpSize, fpPair] : sizeToFpMap )
+        for( auto& [groupKey, fpPair] : groupToFpMap )
         {
             auto& [block_bbox, footprints] = fpPair;
 
-            // Find optimal arrangement of same-size footprints
+            if( footprints.empty() )
+                continue;
 
-            double blockEstimateArea = (double) fpSize.x * fpSize.y * footprints.size();
-            double initialSide = std::sqrt( blockEstimateArea );
-            bool   vertical = fpSize.x >= fpSize.y;
+            std::sort( footprints.begin(), footprints.end(), compareFootprintsbyRef );
 
-            int initialCountPerLine = footprints.size();
+            // 统计组内所有元件相对于各自本体中心的左/右/上/下最大文字外伸量
+            int maxLeftExt   = 0;
+            int maxRightExt  = 0;
+            int maxTopExt    = 0;
+            int maxBottomExt = 0;
 
-            const int singleLineRatio = 5;
-
-            // Wrap the line if the ratio is not satisfied
-            if( vertical )
+            for( const FOOTPRINT* fp : footprints )
             {
-                if( ( fpSize.y * footprints.size() / fpSize.x ) > singleLineRatio )
-                    initialCountPerLine = initialSide / fpSize.y;
+                BOX2I    bodyBox = fp->GetBoundingBox( false );
+                BOX2I    fullBox = getFootprintSafeBBox( fp );
+                VECTOR2I center  = ( bodyBox.GetWidth() > 0 || bodyBox.GetHeight() > 0 )
+                                           ? getBoxCenterSafe( bodyBox )
+                                           : getBoxCenterSafe( fullBox );
+
+                maxLeftExt   = std::max<int>( maxLeftExt, std::max<int>( 0, static_cast<int>( center.x - fullBox.GetLeft() ) ) );
+                maxRightExt  = std::max<int>( maxRightExt, std::max<int>( 0, static_cast<int>( fullBox.GetRight() - center.x ) ) );
+                maxTopExt    = std::max<int>( maxTopExt, std::max<int>( 0, static_cast<int>( center.y - fullBox.GetTop() ) ) );
+                maxBottomExt = std::max<int>( maxBottomExt, std::max<int>( 0, static_cast<int>( fullBox.GetBottom() - center.y ) ) );
             }
-            else
+
+            VECTOR2I cellPitch( maxLeftExt + maxRightExt + effectiveCompGap,
+                                maxTopExt + maxBottomExt + effectiveCompGap );
+
+            cellPitch.x = std::max<int>( cellPitch.x, static_cast<int>( pcbIUScale.mmToIU( 1.5 ) ) );
+            cellPitch.y = std::max<int>( cellPitch.y, static_cast<int>( pcbIUScale.mmToIU( 1.5 ) ) );
+
+            // 计算行列折行比例
+            double       blockEstimateArea   = static_cast<double>( cellPitch.x ) * static_cast<double>( cellPitch.y ) * static_cast<double>( footprints.size() );
+            double       initialSide         = std::sqrt( blockEstimateArea );
+            bool         vertical            = cellPitch.x >= cellPitch.y;
+            int          initialCountPerLine = static_cast<int>( footprints.size() );
+            const double singleLineRatio     = 5.0;
+
+            if( footprints.size() > 1 )
             {
-                if( ( fpSize.x * footprints.size() / fpSize.y ) > singleLineRatio )
-                    initialCountPerLine = initialSide / fpSize.x;
+                if( vertical )
+                {
+                    if( ( static_cast<double>( cellPitch.y ) * static_cast<double>( footprints.size() ) / static_cast<double>( cellPitch.x ) ) > singleLineRatio )
+                        initialCountPerLine = std::max<int>( 1, static_cast<int>( KiROUND( initialSide / static_cast<double>( cellPitch.y ) ) ) );
+                }
+                else
+                {
+                    if( ( static_cast<double>( cellPitch.x ) * static_cast<double>( footprints.size() ) / static_cast<double>( cellPitch.y ) ) > singleLineRatio )
+                        initialCountPerLine = std::max<int>( 1, static_cast<int>( KiROUND( initialSide / static_cast<double>( cellPitch.x ) ) ) );
+                }
             }
+
+            initialCountPerLine = std::clamp<int>( initialCountPerLine, 1, static_cast<int>( footprints.size() ) );
 
             int optimalCountPerLine = initialCountPerLine;
-            int optimalRemainder = footprints.size() % optimalCountPerLine;
+            int optimalRemainder    = static_cast<int>( footprints.size() ) % optimalCountPerLine;
 
-            if( optimalRemainder != 0 )
+            if( optimalRemainder != 0 && footprints.size() >= 4 )
             {
-                for( int i = std::max( 2, initialCountPerLine - 2 );
-                     i <= std::min( (int) footprints.size() - 2, initialCountPerLine + 2 ); i++ )
+                for( int i = std::max<int>( 2, initialCountPerLine - 2 );
+                     i <= std::min<int>( static_cast<int>( footprints.size() ) - 2, initialCountPerLine + 2 ); i++ )
                 {
-                    int r = footprints.size() % i;
+                    int r = static_cast<int>( footprints.size() ) % i;
 
                     if( r == 0 || r >= optimalRemainder )
                     {
                         optimalCountPerLine = i;
-                        optimalRemainder = r;
+                        optimalRemainder    = r;
+
+                        if( r == 0 )
+                            break;
                     }
                 }
             }
 
-            std::sort( footprints.begin(), footprints.end(), compareFootprintsbyRef );
-
-            // Arrange footprints in rows or columns (blocks)
+            // 2. 将组内每个元件的焊盘几何中心对齐到等距网格，确保文字 100% 落在安全格子内
             for( unsigned i = 0; i < footprints.size(); i++ )
             {
                 FOOTPRINT* footprint = footprints[i];
 
-                VECTOR2I position = fpSize / 2;
+                int col = vertical ? ( static_cast<int>( i ) / optimalCountPerLine ) : ( static_cast<int>( i ) % optimalCountPerLine );
+                int row = vertical ? ( static_cast<int>( i ) % optimalCountPerLine ) : ( static_cast<int>( i ) / optimalCountPerLine );
 
-                if( vertical )
-                {
-                    position.x += fpSize.x * ( i / optimalCountPerLine );
-                    position.y += fpSize.y * ( i % optimalCountPerLine );
-                }
+                VECTOR2I targetBodyCenter( col * cellPitch.x + effectiveCompGap / 2 + maxLeftExt,
+                                           row * cellPitch.y + effectiveCompGap / 2 + maxTopExt );
+
+                BOX2I    oldBodyBox = footprint->GetBoundingBox( false );
+                BOX2I    oldFullBox = getFootprintSafeBBox( footprint );
+                VECTOR2I curCenter  = ( oldBodyBox.GetWidth() > 0 || oldBodyBox.GetHeight() > 0 )
+                                              ? getBoxCenterSafe( oldBodyBox )
+                                              : getBoxCenterSafe( oldFullBox );
+
+                footprint->Move( targetBodyCenter - curCenter );
+
+                BOX2I placedFullBox = getFootprintSafeBBox( footprint );
+                placedFullBox.Inflate( effectiveCompGap / 2 );
+
+                if( i == 0 )
+                    block_bbox = placedFullBox;
                 else
-                {
-                    position.x += fpSize.x * ( i % optimalCountPerLine );
-                    position.y += fpSize.y * ( i / optimalCountPerLine );
-                }
-
-                BOX2I old_fp_bbox = footprint->GetBoundingBox( false );
-                footprint->Move( position - old_fp_bbox.GetOrigin() );
-
-                BOX2I new_fp_bbox = footprint->GetBoundingBox( false );
-                new_fp_bbox.Inflate( aComponentGap / 2 );
-                block_bbox.Merge( new_fp_bbox );
+                    block_bbox.Merge( placedFullBox );
             }
+
+            // 为每个组块外围增加组间留白，防止不同类型器件边缘文字相碰
+            block_bbox.Inflate( effectiveBlockGap / 2 );
         }
 
         std::vector<RECT_T> vecSubRects;
-        long long           blocksArea = 0;
+        double              blocksArea = 0.0;
 
-        // Fill in arrays for packing of blocks
-        for( auto& [fpSize, fpPair] : sizeToFpMap )
+        // 3. 向上取整转换组块尺寸并进行二维装箱排布
+        for( auto& [groupKey, fpPair] : groupToFpMap )
         {
             auto& [block_bbox, footprints] = fpPair;
 
-            vecSubRects.emplace_back( 0, 0, block_bbox.GetWidth() / scale, block_bbox.GetHeight() / scale, false );
+            int rectW = std::max<int>( 1, static_cast<int>( ( static_cast<int64_t>( block_bbox.GetWidth() ) + scale - 1 ) / scale ) );
+            int rectH = std::max<int>( 1, static_cast<int>( ( static_cast<int64_t>( block_bbox.GetHeight() ) + scale - 1 ) / scale ) );
 
-            blocksArea += block_bbox.GetArea();
+            vecSubRects.emplace_back( 0, 0, rectW, rectH, false );
+            blocksArea += static_cast<double>( block_bbox.GetWidth() ) * static_cast<double>( block_bbox.GetHeight() );
         }
 
-        // Pack the blocks
-        int areaSide = KiROUND( std::sqrt( blocksArea ) );
+        int areaSide = std::max<int>( scale * 10, static_cast<int>( KiROUND( std::sqrt( blocksArea ) ) ) );
         spreadRectangles( vecSubRects, areaSide, areaSide );
 
-        unsigned block_i = 0;
+        unsigned block_i      = 0;
+        bool     firstInSheet = true;
 
-        // Move footprints to the new block locations
-        for( auto& [fpSize, pair] : sizeToFpMap )
+        for( auto& [groupKey, pair] : groupToFpMap )
         {
             auto& [src_bbox, footprints] = pair;
 
@@ -242,18 +350,28 @@ void SpreadFootprints( std::vector<FOOTPRINT*>* aFootprints, const VECTOR2I& aTa
             VECTOR2I target_pos( srect.x * scale, srect.y * scale );
             VECTOR2I target_size( srect.w * scale, srect.h * scale );
 
-            // Avoid too large coordinates: Overlapping components
-            // are better than out of screen components
-            if( (uint64_t) target_pos.x + (uint64_t) target_size.x > INT_MAX / 2 )
+            if( static_cast<uint64_t>( target_pos.x ) + static_cast<uint64_t>( target_size.x ) > INT_MAX / 2 )
                 target_pos.x -= INT_MAX / 2;
 
-            if( (uint64_t) target_pos.y + (uint64_t) target_size.y > INT_MAX / 2 )
+            if( static_cast<uint64_t>( target_pos.y ) + static_cast<uint64_t>( target_size.y ) > INT_MAX / 2 )
                 target_pos.y -= INT_MAX / 2;
+
+            VECTOR2I delta = target_pos - src_bbox.GetPosition();
 
             for( FOOTPRINT* footprint : footprints )
             {
-                footprint->Move( target_pos - src_bbox.GetPosition() );
-                sheet_bbox.Merge( footprint->GetBoundingBox( false ) );
+                footprint->Move( delta );
+
+                BOX2I fpFullBox = getFootprintSafeBBox( footprint );
+                if( firstInSheet )
+                {
+                    sheet_bbox   = fpFullBox;
+                    firstInSheet = false;
+                }
+                else
+                {
+                    sheet_bbox.Merge( fpFullBox );
+                }
             }
 
             block_i++;
@@ -261,52 +379,51 @@ void SpreadFootprints( std::vector<FOOTPRINT*>* aFootprints, const VECTOR2I& aTa
     }
 
     std::vector<RECT_T> vecSubRects;
-    long long           sheetsArea = 0;
+    double              sheetsArea = 0.0;
 
-    // Fill in arrays for packing of hierarchical sheet groups
+    // 4. 对多页原理图分组打包并保留页间间隔
     for( auto& [sheetPath, sheetPair] : sheetsMap )
     {
-        auto& [sheet_bbox, sizeToFpMap] = sheetPair;
-        BOX2I rect = sheet_bbox;
+        auto& [sheet_bbox, groupToFpMap] = sheetPair;
 
-        // Add a margin around the sheet placement area:
-        rect.Inflate( aGroupGap );
+        sheet_bbox.Inflate( effectiveGroupGap / 2 );
 
-        vecSubRects.emplace_back( 0, 0, rect.GetWidth() / scale, rect.GetHeight() / scale, false );
+        int rectW = std::max<int>( 1, static_cast<int>( ( static_cast<int64_t>( sheet_bbox.GetWidth() ) + scale - 1 ) / scale ) );
+        int rectH = std::max<int>( 1, static_cast<int>( ( static_cast<int64_t>( sheet_bbox.GetHeight() ) + scale - 1 ) / scale ) );
 
-        sheetsArea += sheet_bbox.GetArea();
+        vecSubRects.emplace_back( 0, 0, rectW, rectH, false );
+        sheetsArea += static_cast<double>( sheet_bbox.GetWidth() ) * static_cast<double>( sheet_bbox.GetHeight() );
     }
 
-    // Pack the hierarchical sheet groups
-    int areaSide = std::sqrt( sheetsArea );
+    int areaSide = std::max<int>( scale * 10, static_cast<int>( KiROUND( std::sqrt( sheetsArea ) ) ) );
     spreadRectangles( vecSubRects, areaSide, areaSide );
 
     unsigned srect_i = 0;
 
-    // Move footprints to the new hierarchical sheet group locations
     for( auto& [sheetPath, sheetPair] : sheetsMap )
     {
-        auto& [src_bbox, sizeToFpMap] = sheetPair;
+        auto& [src_bbox, groupToFpMap] = sheetPair;
 
         RECT_T srect = vecSubRects[srect_i];
 
-        VECTOR2I target_pos( srect.x * scale + aTargetBoxPosition.x, srect.y * scale + aTargetBoxPosition.y );
+        VECTOR2I target_pos( srect.x * scale + aTargetBoxPosition.x,
+                             srect.y * scale + aTargetBoxPosition.y );
         VECTOR2I target_size( srect.w * scale, srect.h * scale );
 
-        // Avoid too large coordinates: Overlapping components
-        // are better than out of screen components
-        if( (int64_t) target_pos.x + (int64_t) target_size.x > INT_MAX / 2 )
+        if( static_cast<int64_t>( target_pos.x ) + static_cast<int64_t>( target_size.x ) > INT_MAX / 2 )
             target_pos.x -= INT_MAX / 2;
 
-        if( (int64_t) target_pos.y + (int64_t) target_size.y > INT_MAX / 2 )
+        if( static_cast<int64_t>( target_pos.y ) + static_cast<int64_t>( target_size.y ) > INT_MAX / 2 )
             target_pos.y -= INT_MAX / 2;
 
-        for( auto& [fpSize, fpPair] : sizeToFpMap )
+        VECTOR2I delta = target_pos - src_bbox.GetPosition();
+
+        for( auto& [groupKey, fpPair] : groupToFpMap )
         {
             auto& [block_bbox, footprints] = fpPair;
 
             for( FOOTPRINT* footprint : footprints )
-                footprint->Move( target_pos - src_bbox.GetPosition() );
+                footprint->Move( delta );
         }
 
         srect_i++;
