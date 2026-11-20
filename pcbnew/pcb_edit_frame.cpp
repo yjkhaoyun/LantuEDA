@@ -163,6 +163,37 @@
 
 using namespace std::placeholders;
 
+// LantuEDA 单窗口多标签协同：通知主外壳激活指定编辑器标签页
+static constexpr int ID_LANTU_ACTIVATE_TAB = 59901;
+
+static void notifyLantuActivateTab( KIWAY& /*aKiway*/, wxWindow* aFrame )
+{
+    if( !aFrame || !wxTheApp )
+        return;
+
+    wxWindow* targetTop = nullptr;
+
+    for( wxWindow* win : wxTopLevelWindows )
+    {
+        if( auto* edaFrame = dynamic_cast<EDA_BASE_FRAME*>( win );
+            edaFrame && edaFrame->IsType( KICAD_MAIN_FRAME_T ) )
+        {
+            targetTop = edaFrame;
+            break;
+        }
+    }
+
+    if( !targetTop )
+        targetTop = wxTheApp->GetTopWindow();
+
+    if( targetTop && targetTop != aFrame )
+    {
+        wxCommandEvent evt( wxEVT_MENU, ID_LANTU_ACTIVATE_TAB );
+        evt.SetClientData( aFrame );
+        wxPostEvent( targetTop, evt );
+    }
+}
+
 wxDEFINE_EVENT( EDA_EVT_PCB_LAST_SCH_SHEET_CHANGED, wxCommandEvent );
 
 
@@ -226,7 +257,8 @@ PCB_EDIT_FRAME::PCB_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
         m_importProperties( nullptr ),
         m_eventCounterTimer( nullptr )
 {
-    m_maximizeByDefault = true;
+    // 仅独立启动时默认最大化；在 LantuEDA 单窗口主壳内由标签宿主自动铺满，避免闪屏
+    m_maximizeByDefault = Kiface().IsSingle();
     m_showBorderAndTitleBlock = true;   // true to display sheet references
     m_SelTrackWidthBox = nullptr;
     m_SelViaSizeBox = nullptr;
@@ -566,11 +598,14 @@ PCB_EDIT_FRAME::PCB_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
     appK2S.SetExt( wxT( "exe" ) );
 #endif
 
-    // Ensure the window is on top
-    Raise();
+    // Ensure the window is on top (or activate its tab inside LantuEDA)
+    if( Kiface().IsSingle() )
+        Raise();
+    else
+        notifyLantuActivateTab( Kiway(), this );
 
 //    if( !appK2S.FileExists() )
- //       GetMenuBar()->FindItem( ID_GEN_EXPORT_FILE_STEP )->Enable( false );
+//        GetMenuBar()->FindItem( ID_GEN_EXPORT_FILE_STEP )->Enable( false );
 
     // AUI doesn't refresh properly on wxMac after changes in eb7dc6dd, so force it to
 #ifdef __WXMAC__
@@ -588,10 +623,10 @@ PCB_EDIT_FRAME::PCB_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
     CallAfter( [this]()
                {
                    // Ensure the controls on the toolbars all are correctly sized
-                    UpdateToolbarControlSizes();
+                   UpdateToolbarControlSizes();
 
-                    // Update the angle snap mode toolbar button to reflect the current preference
-                    GetToolManager()->RunAction( PCB_ACTIONS::angleSnapModeChanged );
+                   // Update the angle snap mode toolbar button to reflect the current preference
+                   GetToolManager()->RunAction( PCB_ACTIONS::angleSnapModeChanged );
                } );
 
     if( ADVANCED_CFG::GetCfg().m_ShowEventCounters )
@@ -608,7 +643,6 @@ PCB_EDIT_FRAME::PCB_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
                             static_cast<KIGFX::WX_VIEW_CONTROLS*>( GetCanvas()->GetViewControls() );
                     vc->m_MotionEventCounter->Show();
                     vc->m_MotionEventCounter->Reset();
-
                 },
                 m_eventCounterTimer->GetId() );
 
@@ -943,7 +977,7 @@ void PCB_EDIT_FRAME::SetPageSettings( const PAGE_INFO& aPageSettings )
 
     if( screen != nullptr )
     {
-        drawingSheet->SetPageNumber(TO_UTF8( screen->GetPageNumber() ) );
+        drawingSheet->SetPageNumber( TO_UTF8( screen->GetPageNumber() ) );
         drawingSheet->SetSheetCount( screen->GetPageCount() );
     }
 
@@ -1090,7 +1124,7 @@ void PCB_EDIT_FRAME::setupUIConditions()
     PCB_EDITOR_CONDITIONS cond( this );
 
     auto undoCond =
-            [ this ] (const SELECTION& aSel )
+            [ this ] ( const SELECTION& aSel )
             {
                 DRAWING_TOOL* drawingTool = m_toolManager->GetTool<DRAWING_TOOL>();
 
@@ -1167,8 +1201,8 @@ void PCB_EDIT_FRAME::setupUIConditions()
     mgr->SetConditions( PCB_ACTIONS::lock,     ENABLE( PCB_SELECTION_CONDITIONS::HasUnlockedItems ) );
     mgr->SetConditions( PCB_ACTIONS::unlock,   ENABLE( PCB_SELECTION_CONDITIONS::HasLockedItems ) );
 
-    mgr->SetConditions( PCB_ACTIONS::placeLinkedDesignBlock, ENABLE( groupWithDesignBlockLink) );
-    mgr->SetConditions( PCB_ACTIONS::saveToLinkedDesignBlock, ENABLE( groupWithDesignBlockLink) );
+    mgr->SetConditions( PCB_ACTIONS::placeLinkedDesignBlock, ENABLE( groupWithDesignBlockLink ) );
+    mgr->SetConditions( PCB_ACTIONS::saveToLinkedDesignBlock, ENABLE( groupWithDesignBlockLink ) );
 
     mgr->SetConditions( PCB_ACTIONS::padDisplayMode,   CHECK( !cond.PadFillDisplay() ) );
     mgr->SetConditions( PCB_ACTIONS::viaDisplayMode,   CHECK( !cond.ViaFillDisplay() ) );
@@ -1244,7 +1278,7 @@ void PCB_EDIT_FRAME::setupUIConditions()
             };
 
     auto designBlockCond =
-            [ this ] (const SELECTION& aSel )
+            [ this ] ( const SELECTION& aSel )
             {
                 return m_auimgr.GetPane( DesignBlocksPaneName() ).IsShown();
             };
@@ -1256,14 +1290,14 @@ void PCB_EDIT_FRAME::setupUIConditions()
             };
 
     auto globalRatsnestCond =
-            [this] (const SELECTION& )
+            [this] ( const SELECTION& )
             {
                 PCBNEW_SETTINGS* cfg = GetPcbNewSettings();
                 return cfg && cfg->m_Display.m_ShowGlobalRatsnest;
             };
 
     auto curvedRatsnestCond =
-            [this] (const SELECTION& )
+            [this] ( const SELECTION& )
             {
                 PCBNEW_SETTINGS* cfg = GetPcbNewSettings();
                 return cfg && cfg->m_Display.m_DisplayRatsnestLinesCurved;
@@ -1458,9 +1492,9 @@ void PCB_EDIT_FRAME::setupUIConditions()
     CURRENT_EDIT_TOOL( ACTIONS::deleteTool );
     CURRENT_EDIT_TOOL( PCB_ACTIONS::placeFootprint );
     CURRENT_EDIT_TOOL( PCB_ACTIONS::placeDesignBlock );
-    CURRENT_EDIT_TOOL( PCB_ACTIONS::routeSingleTrack);
+    CURRENT_EDIT_TOOL( PCB_ACTIONS::routeSingleTrack );
     CURRENT_EDIT_TOOL( PCB_ACTIONS::routeDiffPair );
-    CURRENT_EDIT_TOOL( PCB_ACTIONS::tuneSingleTrack);
+    CURRENT_EDIT_TOOL( PCB_ACTIONS::tuneSingleTrack );
     CURRENT_EDIT_TOOL( PCB_ACTIONS::tuneDiffPair );
     CURRENT_EDIT_TOOL( PCB_ACTIONS::tuneSkew );
     CURRENT_EDIT_TOOL( PCB_ACTIONS::showDiffPhaseSkew );
@@ -1908,7 +1942,7 @@ void PCB_EDIT_FRAME::ShowBoardSetupDialog( const wxString& aInitialPage, wxWindo
         ReCreateAuxiliaryToolbar();
         m_toolManager->ResetTools( TOOL_BASE::MODEL_RELOAD );
 
-        //this event causes the routing tool to reload its design rules information
+        // this event causes the routing tool to reload its design rules information
         TOOL_EVENT toolEvent( TC_COMMAND, TA_MODEL_CHANGE, AS_ACTIVE );
         toolEvent.SetHasPosition( false );
         m_toolManager->ProcessEvent( toolEvent );
@@ -2019,7 +2053,6 @@ COLOR4D PCB_EDIT_FRAME::GetGridColor()
 
 void PCB_EDIT_FRAME::SetGridColor( const COLOR4D& aColor )
 {
-
     GetColorSettings()->SetColor( LAYER_GRID, aColor );
     GetCanvas()->GetGAL()->SetGridColor( aColor );
 }
@@ -2041,19 +2074,19 @@ void PCB_EDIT_FRAME::SetActiveLayer( PCB_LAYER_ID aLayer, bool aForceRedraw )
     GetCanvas()->SetHighContrastLayer( aLayer );
 
     /*
-    * Only show pad, via and track clearances when a copper layer is active
-    * and then only show the clearance layer for that copper layer. For
-    * front/back non-copper layers, show the clearance layer for the outer
-    * layer on that side.
-    *
-    * For pads/vias, this is to avoid clutter when there are pad/via layers
-    * that vary in flash (i.e. clearance from the hole or pad edge), padstack
-    * shape on each layer or clearances on each layer.
-    *
-    * For tracks, this follows the same logic as pads/vias, but in theory could
-    * have their own set of independent clearance layers to allow track clearance
-    * to be shown for more layers.
-    */
+     * Only show pad, via and track clearances when a copper layer is active
+     * and then only show the clearance layer for that copper layer. For
+     * front/back non-copper layers, show the clearance layer for the outer
+     * layer on that side.
+     *
+     * For pads/vias, this is to avoid clutter when there are pad/via layers
+     * that vary in flash (i.e. clearance from the hole or pad edge), padstack
+     * shape on each layer or clearances on each layer.
+     *
+     * For tracks, this follows the same logic as pads/vias, but in theory could
+     * have their own set of independent clearance layers to allow track clearance
+     * to be shown for more layers.
+     */
     const auto getClearanceLayerForActive =
             []( PCB_LAYER_ID aActiveLayer ) -> std::optional<int>
             {
@@ -2225,7 +2258,7 @@ void PCB_EDIT_FRAME::SetElementVisibility( GAL_LAYER_ID aElement, bool aNewState
     if( aElement == LAYER_RATSNEST )
         GetCanvas()->GetView()->SetLayerVisible( aElement, true );
     else
-        GetCanvas()->GetView()->SetLayerVisible( aElement , aNewState );
+        GetCanvas()->GetView()->SetLayerVisible( aElement, aNewState );
 
     GetBoard()->SetElementVisibility( aElement, aNewState );
 }
@@ -2516,9 +2549,10 @@ int PCB_EDIT_FRAME::TestStandalone()
 
         // bring ourselves back to the front
         Raise();
+        notifyLantuActivateTab( Kiway(), this );
     }
 
-    return 1;            //Success!
+    return 1;            // Success!
 }
 
 
@@ -2538,6 +2572,7 @@ bool PCB_EDIT_FRAME::FetchNetlistFromSchematic( NETLIST& aNetlist, const wxStrin
         return false;
 
     Raise();                // Show
+    notifyLantuActivateTab( Kiway(), this );
 
     std::string payload( aAnnotateMessage );
 
@@ -2553,6 +2588,7 @@ bool PCB_EDIT_FRAME::FetchNetlistFromSchematic( NETLIST& aNetlist, const wxStrin
                 schFrame->Iconize( false );
 
             schFrame->Raise();
+            notifyLantuActivateTab( Kiway(), schFrame );
 
             // Raising the window does not set the focus on Linux.  This should work on
             // any platform.
@@ -2566,6 +2602,7 @@ bool PCB_EDIT_FRAME::FetchNetlistFromSchematic( NETLIST& aNetlist, const wxStrin
     if( payload == aAnnotateMessage )
     {
         Raise();
+        notifyLantuActivateTab( Kiway(), this );
         DisplayErrorMessage( this, aAnnotateMessage );
         return false;
     }
@@ -2579,6 +2616,7 @@ bool PCB_EDIT_FRAME::FetchNetlistFromSchematic( NETLIST& aNetlist, const wxStrin
     catch( const IO_ERROR& e )
     {
         Raise();
+        notifyLantuActivateTab( Kiway(), this );
 
         // Do not translate extra_info strings.  These are for developers
         wxString extra_info = e.Problem() + wxT( " : " ) + e.What() + wxT( " at " ) + e.Where();
@@ -2636,6 +2674,7 @@ void PCB_EDIT_FRAME::ShowFootprintPropertiesDialog( FOOTPRINT* aFootprint )
             fp_editor->LoadFootprintFromBoard( aFootprint );
             fp_editor->Show( true );
             fp_editor->Raise();        // Iconize( false );
+            notifyLantuActivateTab( Kiway(), fp_editor );
         }
     }
     else if( retvalue == DIALOG_FOOTPRINT_PROPERTIES::FP_PROPS_EDIT_LIBRARY_FP )
@@ -2647,6 +2686,7 @@ void PCB_EDIT_FRAME::ShowFootprintPropertiesDialog( FOOTPRINT* aFootprint )
             fp_editor->LoadFootprintFromLibrary( aFootprint->GetFPID() );
             fp_editor->Show( true );
             fp_editor->Raise();        // Iconize( false );
+            notifyLantuActivateTab( Kiway(), fp_editor );
         }
     }
     else if( retvalue == DIALOG_FOOTPRINT_PROPERTIES::FP_PROPS_UPDATE_FP )
@@ -2824,7 +2864,7 @@ bool PCB_EDIT_FRAME::GetPluginActionButtonVisible( const wxString& aPluginPath, 
     }
 
     // Plugin is not in settings, return default.
-    return  aPluginDefault;
+    return aPluginDefault;
 }
 
 
@@ -3072,7 +3112,7 @@ void PCB_EDIT_FRAME::OnEditItemRequest( BOARD_ITEM* aItem )
     {
         DIALOG_TABLE_PROPERTIES dlg( this, static_cast<PCB_TABLE*>( aItem ) );
 
-        //QuasiModal required for Scintilla auto-complete
+        // QuasiModal required for Scintilla auto-complete
         dlg.ShowQuasiModal();
         break;
     }

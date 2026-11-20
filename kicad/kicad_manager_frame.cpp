@@ -42,14 +42,12 @@
 #include <eda_base_frame.h>
 #include <executable_names.h>
 #include <file_history.h>
-#include <local_history.h>
 #include <policy_keys.h>
 #include <gestfich.h>
 #include <kiplatform/app.h>
 #include <kiplatform/environment.h>
 #include <kiplatform/ui.h>
 #include <kiplatform/policy.h>
-#include <build_version.h>
 #include <kiway.h>
 #include <kiway_mail.h>
 #include <launch_ext.h>
@@ -72,18 +70,23 @@
 #include <widgets/app_progress_dialog.h>
 #include <widgets/kistatusbar.h>
 #include <widgets/ui_common.h>
+#include <wx/dcbuffer.h>
 #include <wx/ffile.h>
 #include <wx/filedlg.h>
 #include <wx/dnd.h>
+#include <wx/menu.h>
 #include <wx/process.h>
+#include <wx/timer.h>
+#include <wx/toplevel.h>
 #include <algorithm>
 #include <atomic>
+#include <memory>
+#include <vector>
 #include <update_manager.h>
 #include <jobs/jobset.h>
 #include <widgets/wx_aui_art_providers.h>
 
 #include <../pcbnew/pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>   // for SEXPR_BOARD_FILE_VERSION def
-
 
 #ifdef __WXMAC__
 #include <MacTypes.h>
@@ -95,13 +98,751 @@
 
 #include <project/project_file.h>
 
+// See below the purpose of this include
+#include <wx/xml/xml.h>
 
-#define EDITORS_CAPTION _( "Editors" )
-#define PROJECT_FILES_CAPTION _( "Project Files" )
+#ifdef __WXMSW__
+#include <wx/msw/wrapwin.h>
+#endif
 
-#define ID_INIT_WATCHED_PATHS 52913
+#define EDITORS_CAPTION        wxString::FromUTF8( "开始页" )
+#define PROJECT_FILES_CAPTION  _( "Project Files" )
+
+#define ID_INIT_WATCHED_PATHS  52913
+#define ID_LANTU_ACTIVATE_TAB  59901
 
 #define SEP()   wxFileName::GetPathSeparator()
+
+
+// ============================================================================
+// LantuEDA 单窗口标签页宿主与全局动态菜单代理引擎（Windows 原生无缝嵌入）
+// ============================================================================
+namespace
+{
+
+static bool IsFrameInTopLevelList( wxFrame* aFrame )
+{
+    if( !aFrame )
+        return false;
+
+    for( wxWindow* win : wxTopLevelWindows )
+    {
+        if( win == aFrame )
+            return true;
+    }
+
+    return false;
+}
+
+
+/**
+ * 顶部全局动态菜单栏：
+ * 始终保持在主窗口最上方，根据当前激活的标签页自动呈现对应编辑器的 wxMenuBar，
+ * 并通过 Win32 TrackPopupMenuEx 原生弹出真实菜单（完整保留所有 UpdateUI 状态、勾选与插件项）。
+ */
+class LANTU_PROXY_MENUBAR : public wxPanel
+{
+public:
+    explicit LANTU_PROXY_MENUBAR( wxWindow* aParent )
+        : wxPanel( aParent, wxID_ANY, wxDefaultPosition, wxSize( -1, aParent->FromDIP( 26 ) ) ),
+          m_targetFrame( nullptr ),
+          m_hoverIdx( -1 ),
+          m_openIdx( -1 )
+    {
+        SetBackgroundStyle( wxBG_STYLE_PAINT );
+        Bind( wxEVT_PAINT, &LANTU_PROXY_MENUBAR::OnPaint, this );
+        Bind( wxEVT_MOTION, &LANTU_PROXY_MENUBAR::OnMouseMove, this );
+        Bind( wxEVT_LEAVE_WINDOW, &LANTU_PROXY_MENUBAR::OnMouseLeave, this );
+        Bind( wxEVT_LEFT_DOWN, &LANTU_PROXY_MENUBAR::OnMouseDown, this );
+    }
+
+    void SetTargetFrame( wxFrame* aFrame )
+    {
+        if( m_targetFrame != aFrame )
+        {
+            m_targetFrame = aFrame;
+            m_hoverIdx = -1;
+            m_openIdx = -1;
+            Refresh();
+        }
+    }
+
+    wxFrame* GetTargetFrame() const { return m_targetFrame; }
+
+private:
+    wxFrame*             m_targetFrame;
+    std::vector<wxRect>  m_itemRects;
+    int                  m_hoverIdx;
+    int                  m_openIdx;
+
+    void OnPaint( wxPaintEvent& )
+    {
+        wxAutoBufferedPaintDC dc( this );
+        wxSize sz = GetClientSize();
+
+        dc.SetBrush( wxBrush( wxColour( 248, 249, 251 ) ) );
+        dc.SetPen( *wxTRANSPARENT_PEN );
+        dc.DrawRectangle( 0, 0, sz.x, sz.y );
+
+        dc.SetPen( wxPen( wxColour( 218, 223, 230 ), 1 ) );
+        dc.DrawLine( 0, sz.y - 1, sz.x, sz.y - 1 );
+
+        m_itemRects.clear();
+
+        if( !m_targetFrame || !IsFrameInTopLevelList( m_targetFrame ) )
+            return;
+
+        wxMenuBar* mb = m_targetFrame->GetMenuBar();
+        if( !mb )
+            return;
+
+        wxFont font = GetFont();
+        dc.SetFont( font );
+
+        int x = FromDIP( 4 );
+        const int padX = FromDIP( 9 );
+        const size_t count = mb->GetMenuCount();
+
+        for( size_t i = 0; i < count; ++i )
+        {
+            wxString label = mb->GetMenuLabelText( i );
+            wxSize textSz = dc.GetTextExtent( label );
+            int itemW = textSz.x + padX * 2;
+            wxRect rect( x, FromDIP( 2 ), itemW, sz.y - FromDIP( 4 ) );
+            m_itemRects.push_back( rect );
+
+            bool isActive = ( static_cast<int>( i ) == m_openIdx );
+            bool isHover  = ( static_cast<int>( i ) == m_hoverIdx );
+
+            if( isActive )
+            {
+                dc.SetBrush( wxBrush( wxColour( 208, 226, 250 ) ) );
+                dc.SetPen( wxPen( wxColour( 150, 188, 240 ), 1 ) );
+                dc.DrawRoundedRectangle( rect, 3 );
+                dc.SetTextForeground( wxColour( 20, 75, 165 ) );
+            }
+            else if( isHover )
+            {
+                dc.SetBrush( wxBrush( wxColour( 228, 235, 245 ) ) );
+                dc.SetPen( *wxTRANSPARENT_PEN );
+                dc.DrawRoundedRectangle( rect, 3 );
+                dc.SetTextForeground( wxColour( 30, 35, 45 ) );
+            }
+            else
+            {
+                dc.SetTextForeground( wxColour( 40, 45, 55 ) );
+            }
+
+            int textY = rect.y + ( rect.height - textSz.y ) / 2;
+            dc.DrawText( label, rect.x + padX, textY );
+
+            x += itemW + FromDIP( 2 );
+        }
+    }
+
+    int HitTest( const wxPoint& aPt ) const
+    {
+        for( size_t i = 0; i < m_itemRects.size(); ++i )
+        {
+            if( m_itemRects[i].Contains( aPt ) )
+                return static_cast<int>( i );
+        }
+        return -1;
+    }
+
+    void OnMouseMove( wxMouseEvent& aEvt )
+    {
+        int idx = HitTest( aEvt.GetPosition() );
+        if( idx != m_hoverIdx )
+        {
+            m_hoverIdx = idx;
+            Refresh();
+        }
+    }
+
+    void OnMouseLeave( wxMouseEvent& )
+    {
+        if( m_hoverIdx != -1 )
+        {
+            m_hoverIdx = -1;
+            Refresh();
+        }
+    }
+
+    void OnMouseDown( wxMouseEvent& aEvt )
+    {
+        int idx = HitTest( aEvt.GetPosition() );
+        if( idx < 0 || !m_targetFrame || !IsFrameInTopLevelList( m_targetFrame ) )
+            return;
+
+        wxMenuBar* mb = m_targetFrame->GetMenuBar();
+        if( !mb || static_cast<size_t>( idx ) >= mb->GetMenuCount() )
+            return;
+
+        wxMenu* menu = mb->GetMenu( static_cast<size_t>( idx ) );
+        if( !menu )
+            return;
+
+        m_openIdx = idx;
+        Refresh();
+        Update();
+
+#ifdef __WXMSW__
+        HMENU hSubMenu = reinterpret_cast<HMENU>( menu->GetHMenu() );
+        HWND targetHwnd = reinterpret_cast<HWND>( m_targetFrame->GetHWND() );
+        wxWindow* topWin = wxGetTopLevelParent( this );
+        HWND topHwnd = topWin ? reinterpret_cast<HWND>( topWin->GetHWND() ) : targetHwnd;
+
+        if( hSubMenu && targetHwnd && ::IsWindow( targetHwnd ) )
+        {
+            wxPoint screenPt = ClientToScreen( wxPoint( m_itemRects[idx].x, GetClientSize().y ) );
+            ::SetForegroundWindow( topHwnd );
+            ::TrackPopupMenuEx( hSubMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
+                                screenPt.x, screenPt.y, targetHwnd, nullptr );
+            ::PostMessage( topHwnd, WM_NULL, 0, 0 );
+        }
+#endif
+        m_openIdx = -1;
+        m_hoverIdx = -1;
+        Refresh();
+    }
+};
+
+
+/**
+ * 标签页内部宿主面板：用于承载一个被 Win32 SetParent 嵌入的独立 KiCad 编辑器 wxFrame。
+ */
+class LANTU_EMBEDDED_FRAME_PAGE : public wxPanel
+{
+public:
+    LANTU_EMBEDDED_FRAME_PAGE( wxWindow* aParent, wxFrame* aEmbeddedFrame )
+        : wxPanel( aParent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxCLIP_CHILDREN ),
+          m_frame( aEmbeddedFrame )
+    {
+        SetBackgroundColour( wxColour( 240, 243, 248 ) );
+        Bind( wxEVT_SIZE, &LANTU_EMBEDDED_FRAME_PAGE::OnSize, this );
+        Bind( wxEVT_SHOW, &LANTU_EMBEDDED_FRAME_PAGE::OnShow, this );
+
+        AttachFrame();
+    }
+
+    ~LANTU_EMBEDDED_FRAME_PAGE() override
+    {
+        DetachFrame();
+    }
+
+    wxFrame* GetEmbeddedFrame() const { return m_frame; }
+
+    void AttachFrame()
+    {
+#ifdef __WXMSW__
+        if( !m_frame || !IsFrameInTopLevelList( m_frame ) )
+            return;
+
+        HWND childHwnd = reinterpret_cast<HWND>( m_frame->GetHWND() );
+        HWND hostHwnd  = reinterpret_cast<HWND>( GetHWND() );
+        if( !childHwnd || !hostHwnd || !::IsWindow( childHwnd ) )
+            return;
+
+        // 剥离独立标题栏、边框、最大化状态与任务栏入口
+        LONG_PTR style = ::GetWindowLongPtr( childHwnd, GWL_STYLE );
+        style &= ~( WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
+                    | WS_SYSMENU | WS_BORDER | WS_DLGFRAME | WS_MAXIMIZE | WS_MINIMIZE );
+        style |= ( WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS );
+        ::SetWindowLongPtr( childHwnd, GWL_STYLE, style );
+
+        LONG_PTR exStyle = ::GetWindowLongPtr( childHwnd, GWL_EXSTYLE );
+        exStyle &= ~( WS_EX_APPWINDOW | WS_EX_WINDOWEDGE | WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE );
+        ::SetWindowLongPtr( childHwnd, GWL_EXSTYLE, exStyle );
+
+        // 隐藏原生子窗口菜单条（已由顶部 LANTU_PROXY_MENUBAR 统一接管）
+        if( ::GetMenu( childHwnd ) != nullptr )
+            ::SetMenu( childHwnd, nullptr );
+
+        ::SetParent( childHwnd, hostHwnd );
+
+        wxSize sz = GetClientSize();
+        ::SetWindowPos( childHwnd, HWND_TOP, 0, 0, std::max( 1, sz.x ), std::max( 1, sz.y ),
+                        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW );
+#endif
+    }
+
+    void DetachFrame()
+    {
+#ifdef __WXMSW__
+        if( m_frame && IsFrameInTopLevelList( m_frame ) )
+        {
+            HWND childHwnd = reinterpret_cast<HWND>( m_frame->GetHWND() );
+            HWND hostHwnd  = reinterpret_cast<HWND>( GetHWND() );
+            if( childHwnd && ::IsWindow( childHwnd ) && ::GetParent( childHwnd ) == hostHwnd )
+            {
+                ::ShowWindow( childHwnd, SW_HIDE );
+                ::SetParent( childHwnd, nullptr );
+            }
+        }
+#endif
+        m_frame = nullptr;
+    }
+
+    void SyncChildSize()
+    {
+#ifdef __WXMSW__
+        if( !m_frame || !IsFrameInTopLevelList( m_frame ) )
+            return;
+
+        HWND childHwnd = reinterpret_cast<HWND>( m_frame->GetHWND() );
+        HWND hostHwnd  = reinterpret_cast<HWND>( GetHWND() );
+        if( !childHwnd || !hostHwnd || !::IsWindow( childHwnd ) )
+            return;
+
+        if( ::GetParent( childHwnd ) != hostHwnd )
+            AttachFrame();
+
+        // 若编辑器内部重建了菜单栏或触发了最大化标志，立刻重新归位
+        if( ::GetMenu( childHwnd ) != nullptr )
+            ::SetMenu( childHwnd, nullptr );
+
+        LONG_PTR style = ::GetWindowLongPtr( childHwnd, GWL_STYLE );
+        if( style & ( WS_CAPTION | WS_MAXIMIZE | WS_THICKFRAME ) )
+        {
+            style &= ~( WS_CAPTION | WS_MAXIMIZE | WS_THICKFRAME | WS_POPUP );
+            style |= ( WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS );
+            ::SetWindowLongPtr( childHwnd, GWL_STYLE, style );
+        }
+
+        wxSize sz = GetClientSize();
+        if( sz.x <= 0 || sz.y <= 0 )
+            return;
+
+        RECT rc{};
+        ::GetWindowRect( childHwnd, &rc );
+        POINT topLeft{ rc.left, rc.top };
+        ::ScreenToClient( hostHwnd, &topLeft );
+
+        int curW = rc.right - rc.left;
+        int curH = rc.bottom - rc.top;
+
+        if( topLeft.x != 0 || topLeft.y != 0 || curW != sz.x || curH != sz.y )
+        {
+            ::SetWindowPos( childHwnd, HWND_TOP, 0, 0, sz.x, sz.y,
+                            SWP_NOACTIVATE | SWP_SHOWWINDOW );
+        }
+#endif
+    }
+
+    void FocusEmbeddedFrame()
+    {
+        if( !m_frame || !IsFrameInTopLevelList( m_frame ) )
+            return;
+
+        if( auto* edaFrame = dynamic_cast<EDA_BASE_FRAME*>( m_frame ) )
+        {
+            if( wxWindow* canvas = edaFrame->GetToolCanvas() )
+            {
+                canvas->SetFocus();
+                return;
+            }
+        }
+
+        m_frame->SetFocus();
+#ifdef __WXMSW__
+        HWND childHwnd = reinterpret_cast<HWND>( m_frame->GetHWND() );
+        if( childHwnd && ::IsWindow( childHwnd ) )
+            ::SetFocus( childHwnd );
+#endif
+    }
+
+private:
+    wxFrame* m_frame;
+
+    void OnSize( wxSizeEvent& aEvt )
+    {
+        SyncChildSize();
+        aEvt.Skip();
+    }
+
+    void OnShow( wxShowEvent& aEvt )
+    {
+        if( aEvt.IsShown() )
+        {
+            SyncChildSize();
+            CallAfter( [this]() { SyncChildSize(); } );
+        }
+        aEvt.Skip();
+    }
+};
+
+
+/**
+ * 单窗口标签调度中心：
+ * 监控所有打开的 KiCad 编辑器窗口并自动收入 m_notebook 标签栏，统一同步顶部菜单与标签标题。
+ */
+class LANTU_TAB_COORDINATOR : public wxEvtHandler
+{
+public:
+    LANTU_TAB_COORDINATOR( KICAD_MANAGER_FRAME* aManager, wxAuiNotebook* aNotebook,
+                           LANTU_PROXY_MENUBAR* aMenuBar )
+        : m_manager( aManager ),
+          m_notebook( aNotebook ),
+          m_menuBar( aMenuBar ),
+          m_shuttingDown( false )
+    {
+        m_timer.SetOwner( this );
+        Bind( wxEVT_TIMER, &LANTU_TAB_COORDINATOR::OnTimer, this, m_timer.GetId() );
+        m_notebook->Bind( wxEVT_AUINOTEBOOK_PAGE_CHANGED, &LANTU_TAB_COORDINATOR::OnPageChanged, this );
+
+        if( m_menuBar )
+            m_menuBar->SetTargetFrame( m_manager );
+
+#ifdef __WXMSW__
+        if( m_manager )
+            ::SetMenu( reinterpret_cast<HWND>( m_manager->GetHWND() ), nullptr );
+#endif
+
+        // 120ms 轻量轮询，即时捕获原理图/PCB/3D查看器等任意 KIFACE 新建窗口
+        m_timer.Start( 120 );
+    }
+
+    ~LANTU_TAB_COORDINATOR() override
+    {
+        Shutdown();
+    }
+
+    void Shutdown()
+    {
+        if( m_shuttingDown )
+            return;
+
+        m_shuttingDown = true;
+        m_timer.Stop();
+
+        if( m_notebook )
+            m_notebook->Unbind( wxEVT_AUINOTEBOOK_PAGE_CHANGED, &LANTU_TAB_COORDINATOR::OnPageChanged, this );
+
+        DetachAllEmbeddedFrames();
+    }
+
+    void DetachAllEmbeddedFrames()
+    {
+        if( !m_notebook )
+            return;
+
+        for( size_t i = 0; i < m_notebook->GetPageCount(); ++i )
+        {
+            if( auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( i ) ) )
+                host->DetachFrame();
+        }
+    }
+
+    void CleanupClosedTabs()
+    {
+        if( m_shuttingDown || !m_notebook )
+            return;
+
+        for( int i = static_cast<int>( m_notebook->GetPageCount() ) - 1; i >= 0; --i )
+        {
+            auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( i ) );
+            if( !host )
+                continue;
+
+            wxFrame* frame = host->GetEmbeddedFrame();
+            if( !frame || !IsFrameInTopLevelList( frame ) || frame->IsBeingDeleted() || !frame->IsShown() )
+            {
+                host->DetachFrame();
+                m_notebook->DeletePage( i );
+            }
+        }
+
+        SyncMenuBarToActiveTab();
+    }
+
+    void RemoveTabForFrame( wxFrame* aFrame )
+    {
+        if( !m_notebook || !aFrame )
+            return;
+
+        for( size_t i = 0; i < m_notebook->GetPageCount(); ++i )
+        {
+            auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( i ) );
+            if( host && host->GetEmbeddedFrame() == aFrame )
+            {
+                host->DetachFrame();
+                m_notebook->DeletePage( i );
+                SyncMenuBarToActiveTab();
+                return;
+            }
+        }
+    }
+
+    void ActivateTabForFrame( wxFrame* aFrame )
+    {
+        if( m_shuttingDown || !m_notebook || !aFrame )
+            return;
+
+        // 若该窗口尚未被嵌入，先立即嵌入
+        if( FindPageIndexByFrame( aFrame ) == wxNOT_FOUND && ShouldEmbedFrame( aFrame ) )
+            EmbedFrame( aFrame );
+
+        int idx = FindPageIndexByFrame( aFrame );
+        if( idx != wxNOT_FOUND )
+        {
+            if( m_notebook->GetSelection() != idx )
+                m_notebook->SetSelection( idx );
+
+            if( auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( idx ) ) )
+            {
+                host->SyncChildSize();
+                host->FocusEmbeddedFrame();
+            }
+
+            SyncMenuBarToActiveTab();
+        }
+    }
+
+    void SyncActiveTabSize()
+    {
+        if( m_shuttingDown || !m_notebook )
+            return;
+
+        int sel = m_notebook->GetSelection();
+        if( sel >= 0 && static_cast<size_t>( sel ) < m_notebook->GetPageCount() )
+        {
+            if( auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( sel ) ) )
+                host->SyncChildSize();
+        }
+    }
+
+    void SyncMenuBarToActiveTab()
+    {
+        if( !m_menuBar || !m_notebook || !m_manager )
+            return;
+
+        wxFrame* target = m_manager;
+        int sel = m_notebook->GetSelection();
+        if( sel >= 0 && static_cast<size_t>( sel ) < m_notebook->GetPageCount() )
+        {
+            if( auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( sel ) ) )
+            {
+                if( wxFrame* f = host->GetEmbeddedFrame(); f && IsFrameInTopLevelList( f ) )
+                    target = f;
+            }
+        }
+
+        m_menuBar->SetTargetFrame( target );
+    }
+
+    void ScanAndSyncFrames()
+    {
+        if( m_shuttingDown || !m_manager || !m_notebook )
+            return;
+
+#ifdef __WXMSW__
+        // 防止主窗口重建菜单栏后恢复出双菜单栏
+        HWND mgrHwnd = reinterpret_cast<HWND>( m_manager->GetHWND() );
+        if( mgrHwnd && ::GetMenu( mgrHwnd ) != nullptr )
+            ::SetMenu( mgrHwnd, nullptr );
+
+        // 1. 扫描所有新打开的编辑器窗口并嵌入标签栏
+        std::vector<wxFrame*> toEmbed;
+        for( wxWindow* win : wxTopLevelWindows )
+        {
+            wxFrame* frame = dynamic_cast<wxFrame*>( win );
+            if( !frame || frame == m_manager )
+                continue;
+
+            if( !frame->IsShown() || frame->IsBeingDeleted() )
+                continue;
+
+            if( FindPageIndexByFrame( frame ) != wxNOT_FOUND )
+                continue;
+
+            if( ShouldEmbedFrame( frame ) )
+                toEmbed.push_back( frame );
+        }
+
+        for( wxFrame* frame : toEmbed )
+            EmbedFrame( frame );
+
+        // 2. 维护已有标签页（同步标题与 * 未保存星号、清理已关闭页、修正尺寸）
+        for( int i = static_cast<int>( m_notebook->GetPageCount() ) - 1; i >= 0; --i )
+        {
+            auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( i ) );
+            if( !host )
+                continue;
+
+            wxFrame* frame = host->GetEmbeddedFrame();
+            if( !frame || !IsFrameInTopLevelList( frame ) || frame->IsBeingDeleted() || !frame->IsShown() )
+            {
+                host->DetachFrame();
+                m_notebook->DeletePage( i );
+                continue;
+            }
+
+            wxString desiredTitle = BuildTabTitle( frame );
+            if( m_notebook->GetPageText( i ) != desiredTitle )
+                m_notebook->SetPageText( i, desiredTitle );
+
+            if( m_notebook->GetSelection() == i )
+                host->SyncChildSize();
+        }
+#endif
+
+        SyncMenuBarToActiveTab();
+    }
+
+    void RefreshMenuBarVisual()
+    {
+        if( m_menuBar )
+            m_menuBar->Refresh();
+    }
+
+private:
+    KICAD_MANAGER_FRAME* m_manager;
+    wxAuiNotebook*       m_notebook;
+    LANTU_PROXY_MENUBAR* m_menuBar;
+    wxTimer              m_timer;
+    bool                 m_shuttingDown;
+
+    int FindPageIndexByFrame( wxFrame* aFrame ) const
+    {
+        if( !m_notebook || !aFrame )
+            return wxNOT_FOUND;
+
+        for( size_t i = 0; i < m_notebook->GetPageCount(); ++i )
+        {
+            auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( i ) );
+            if( host && host->GetEmbeddedFrame() == aFrame )
+                return static_cast<int>( i );
+        }
+        return wxNOT_FOUND;
+    }
+
+    bool ShouldEmbedFrame( wxFrame* aFrame ) const
+    {
+        auto* edaFrame = dynamic_cast<EDA_BASE_FRAME*>( aFrame );
+        if( !edaFrame )
+            return false;
+
+        // 排除主管理器本身及需要模态浮动的选型器/查看器弹窗
+        if( edaFrame->IsType( KICAD_MAIN_FRAME_T ) )
+            return false;
+
+        if( ( aFrame->GetWindowStyleFlag() & wxFRAME_FLOAT_ON_PARENT ) != 0 )
+            return false;
+
+        // 核心编辑器全部纳入单窗口顶部标签页
+        if( edaFrame->IsType( FRAME_SCH )
+            || edaFrame->IsType( FRAME_PCB_EDITOR )
+            || edaFrame->IsType( FRAME_PCB_DISPLAY3D )
+            || edaFrame->IsType( FRAME_SCH_SYMBOL_EDITOR )
+            || edaFrame->IsType( FRAME_FOOTPRINT_EDITOR )
+            || edaFrame->IsType( FRAME_GERBER )
+            || edaFrame->IsType( FRAME_PL_EDITOR ) )
+        {
+            return true;
+        }
+
+        // 兼容图片转换器、计算工具等子窗口
+        wxString name = aFrame->GetName();
+        if( name == wxS( "Frame3D" ) || name == wxS( "Bm2CmpFrame" ) || name == wxS( "PcbCalculatorFrame" ) )
+            return true;
+
+        return false;
+    }
+
+    wxString BuildTabTitle( wxFrame* aFrame ) const
+    {
+        wxString rawTitle = aFrame->GetTitle();
+        bool isDirty = rawTitle.StartsWith( wxT( "*" ) );
+        wxString prefix = isDirty ? wxString( wxS( "*" ) ) : wxString();
+
+        if( auto* edaFrame = dynamic_cast<EDA_BASE_FRAME*>( aFrame ) )
+        {
+            if( edaFrame->IsType( FRAME_SCH ) )
+            {
+                wxString name = rawTitle.BeforeFirst( wxUniChar( 0x2014 ) ).Trim( true ).Trim( false );
+                if( name.StartsWith( wxT( "*" ) ) )
+                    name = name.Mid( 1 );
+                return name.IsEmpty()
+                        ? prefix + wxString::FromUTF8( "原理图" )
+                        : prefix + wxString::FromUTF8( "原理图: " ) + name;
+            }
+            if( edaFrame->IsType( FRAME_PCB_EDITOR ) )
+            {
+                wxString name = rawTitle.BeforeFirst( wxUniChar( 0x2014 ) ).Trim( true ).Trim( false );
+                if( name.StartsWith( wxT( "*" ) ) )
+                    name = name.Mid( 1 );
+                return name.IsEmpty()
+                        ? prefix + wxString::FromUTF8( "PCB" )
+                        : prefix + wxString::FromUTF8( "PCB: " ) + name;
+            }
+            if( edaFrame->IsType( FRAME_PCB_DISPLAY3D ) )
+                return wxString::FromUTF8( "3D 视图" );
+            if( edaFrame->IsType( FRAME_SCH_SYMBOL_EDITOR ) )
+                return prefix + wxString::FromUTF8( "符号编辑器" );
+            if( edaFrame->IsType( FRAME_FOOTPRINT_EDITOR ) )
+                return prefix + wxString::FromUTF8( "封装编辑器" );
+            if( edaFrame->IsType( FRAME_GERBER ) )
+                return wxString::FromUTF8( "Gerber 查看器" );
+            if( edaFrame->IsType( FRAME_PL_EDITOR ) )
+                return prefix + wxString::FromUTF8( "图框编辑器" );
+        }
+
+        return rawTitle.IsEmpty() ? wxString::FromUTF8( "编辑器" ) : rawTitle;
+    }
+
+    void EmbedFrame( wxFrame* aFrame )
+    {
+        if( !aFrame || !m_notebook )
+            return;
+
+        auto* host = new LANTU_EMBEDDED_FRAME_PAGE( m_notebook, aFrame );
+        wxString title = BuildTabTitle( aFrame );
+
+        m_notebook->AddPage( host, title, true );
+        m_notebook->SetTabCtrlHeight( -1 );
+
+        // 延迟一帧确保 AUI 完成布局后再精确铺满并聚焦画布
+        m_manager->CallAfter( [this, aFrame]() {
+            if( m_shuttingDown )
+                return;
+            int idx = FindPageIndexByFrame( aFrame );
+            if( idx != wxNOT_FOUND )
+            {
+                if( auto* h = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( idx ) ) )
+                {
+                    h->SyncChildSize();
+                    h->FocusEmbeddedFrame();
+                }
+            }
+            SyncMenuBarToActiveTab();
+        } );
+    }
+
+    void OnTimer( wxTimerEvent& )
+    {
+        ScanAndSyncFrames();
+    }
+
+    void OnPageChanged( wxAuiNotebookEvent& aEvt )
+    {
+        SyncActiveTabSize();
+        SyncMenuBarToActiveTab();
+
+        int sel = m_notebook->GetSelection();
+        if( sel >= 0 && static_cast<size_t>( sel ) < m_notebook->GetPageCount() )
+        {
+            if( auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( sel ) ) )
+                host->FocusEmbeddedFrame();
+        }
+
+        aEvt.Skip();
+    }
+};
+
+static std::unique_ptr<LANTU_TAB_COORDINATOR> s_tabCoordinator;
+
+} // namespace
 
 
 // Menubar and toolbar event table
@@ -139,8 +880,6 @@ BEGIN_EVENT_TABLE( KICAD_MANAGER_FRAME, EDA_BASE_FRAME )
 
 END_EVENT_TABLE()
 
-// See below the purpose of this include
-#include <wx/xml/xml.h>
 
 KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& title,
                                           const wxPoint& pos, const wxSize&   size ) :
@@ -162,19 +901,8 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     m_leftWinWidth = defaultLeftWinWidth; // Default value
     m_aboutTitle = "LantuEDA";
 
-    // JPC: A very ugly hack to fix an issue on Linux: if the wxbase315u_xml_gcc_custom.so is
-    // used **only** in PCM, it is not found in some cases at run time.
-    // So just use it in the main module to avoid a not found issue
-    // wxbase315u_xml_gcc_custom shared object when launching Kicad
     wxXmlDocument dummy;
 
-    // Create the status line (bottom of the frame).  Left half is for project name; right half
-    // is for Reporter (currently used by archiver/unarchiver and PCM).
-    // Note: this is a KISTATUSBAR status bar. Therefore the specified number of fields
-    // is the extra number of fields, not the full field count.
-    // We need here 2 fields: the extra fiels to display the project name, and another field
-    // to display a info (specific to Windows) using the FIELD_OFFSET_BGJOB_TEXT id offset (=1)
-    // So the extra field count is 1
     CreateStatusBar( 2 );
     Pgm().GetBackgroundJobMonitor().RegisterStatusBar( (KISTATUSBAR*) GetStatusBar() );
     Pgm().GetNotificationsManager().RegisterStatusBar( (KISTATUSBAR*) GetStatusBar() );
@@ -185,7 +913,7 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     wxIcon icon;
     wxIconBundle icon_bundle;
 
-    if( IsNightlyVersion())
+    if( IsNightlyVersion() )
     {
         icon.CopyFromBitmap( KiBitmap( BITMAPS::icon_kicad_nightly, 48 ) );
         icon_bundle.AddIcon( icon );
@@ -231,10 +959,22 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     m_auimgr.SetManagedWindow( this );
     m_auimgr.SetFlags( wxAUI_MGR_LIVE_RESIZE );
 
+    // 顶部统一全局动态菜单栏（随标签页切换自动变为对应编辑器的菜单）
+    LANTU_PROXY_MENUBAR* proxyMenuBar = nullptr;
+#ifdef __WXMSW__
+    proxyMenuBar = new LANTU_PROXY_MENUBAR( this );
+    m_auimgr.AddPane( proxyMenuBar,
+                      wxAuiPaneInfo().Name( wxS( "LantuGlobalMenuBar" ) )
+                                     .Top().Layer( 10 )
+                                     .CaptionVisible( false ).CloseButton( false )
+                                     .Gripper( false ).PaneBorder( false )
+                                     .Floatable( false ).Movable( false ).Resizable( false )
+                                     .BestSize( -1, FromDIP( 26 ) )
+                                     .MinSize( -1, FromDIP( 26 ) ) );
+#endif
+
     m_auimgr.AddPane( m_tbLeft, EDA_PANE().VToolbar().Name( "TopMainToolbar" ).Left().Layer( 2 ) );
 
-    // There is no wxAUIPaneInfo::SetSize(), but a trick is to use MinSize() to set the required pane width,
-    // and after give a reasonable MinSize value.
     m_auimgr.AddPane( m_projectTreePane,
                       EDA_PANE().Palette().Name( "ProjectTree" ).Left().Layer( 1 )
                                 .Caption( PROJECT_FILES_CAPTION ).PaneBorder( false )
@@ -264,7 +1004,8 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     m_notebook->Freeze();
     m_launcher->SetClosable( false );
     m_notebook->AddPage( m_launcher, EDITORS_CAPTION, false );
-    m_notebook->SetTabCtrlHeight( 0 );
+    // 始终显示顶部标签栏，呈现单窗口多标签工作台风格
+    m_notebook->SetTabCtrlHeight( -1 );
     m_notebook->Thaw();
 
     m_auimgr.AddPane( m_notebook, EDA_PANE().Canvas().Name( "Editors" ).Center().Caption( EDITORS_CAPTION )
@@ -272,18 +1013,36 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
 
     m_auimgr.Update();
 
+    // 初始化 LantuEDA 单窗口多标签调度中心
+    s_tabCoordinator = std::make_unique<LANTU_TAB_COORDINATOR>( this, m_notebook, proxyMenuBar );
+
+    // 响应来自 PCB / 原理图等子编辑器的跨标签跳转通知
+    Bind( wxEVT_MENU,
+          []( wxCommandEvent& aEvt )
+          {
+              if( s_tabCoordinator )
+              {
+                  if( auto* targetFrame = static_cast<wxFrame*>( aEvt.GetClientData() ) )
+                      s_tabCoordinator->ActivateTabForFrame( targetFrame );
+              }
+          },
+          ID_LANTU_ACTIVATE_TAB );
+
     // Now the actual m_projectTreePane size is set, give it a reasonable min width
     m_auimgr.GetPane( m_projectTreePane ).MinSize( defaultLeftWinWidth, FromDIP( 80 ) );
 
-
     wxSizer* mainSizer = GetSizer();
 
-    // Only fit the initial window size the first time KiCad is run.
-    if( mainSizer && config()->m_Window.state.size_x == 0 && config()->m_Window.state.size_y == 0 )
+    // 首次运行时默认最大化以提供宽敞的单窗口标签页视野
+    if( config()->m_Window.state.size_x == 0 && config()->m_Window.state.size_y == 0 )
     {
-        Layout();
-        mainSizer->Fit( this );
-        Center();
+        if( mainSizer )
+        {
+            Layout();
+            mainSizer->Fit( this );
+            Center();
+        }
+        Maximize( true );
     }
 
     if( ADVANCED_CFG::GetCfg().m_HideVersionFromTitle )
@@ -299,7 +1058,6 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     m_acceptedExts.emplace( FILEEXT::LegacyProjectFileExtension, &KICAD_MANAGER_ACTIONS::loadProject );
 
     // Gerber files
-    // Note that all gerber files are aliased as GerberFileExtension
     m_acceptedExts.emplace( FILEEXT::GerberFileExtension, &KICAD_MANAGER_ACTIONS::viewDroppedGerbers );
     m_acceptedExts.emplace( FILEEXT::GerberJobFileExtension, &KICAD_MANAGER_ACTIONS::viewDroppedGerbers );
     m_acceptedExts.emplace( FILEEXT::DrillFileExtension, &KICAD_MANAGER_ACTIONS::viewDroppedGerbers );
@@ -310,6 +1068,12 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
 
 KICAD_MANAGER_FRAME::~KICAD_MANAGER_FRAME()
 {
+    if( s_tabCoordinator )
+    {
+        s_tabCoordinator->Shutdown();
+        s_tabCoordinator.reset();
+    }
+
     Unbind( wxEVT_CHAR, &TOOL_DISPATCHER::DispatchWxEvent, m_toolDispatcher );
     Unbind( wxEVT_CHAR_HOOK, &TOOL_DISPATCHER::DispatchWxEvent, m_toolDispatcher );
 
@@ -327,9 +1091,6 @@ KICAD_MANAGER_FRAME::~KICAD_MANAGER_FRAME()
     if( m_pcm )
         m_pcm->StopBackgroundUpdate();
 
-    // Stop update manager before tearing down the AUI framework. The update
-    // task runs on the thread pool and may call CallAfter on this frame, so it
-    // must complete before we uninitialize AUI or destroy child windows.
     m_updateManager.reset();
 
     delete m_actions;
@@ -339,18 +1100,20 @@ KICAD_MANAGER_FRAME::~KICAD_MANAGER_FRAME()
     m_auimgr.UnInit();
 }
 
+
 void KICAD_MANAGER_FRAME::HideTabsIfNeeded()
 {
-    if( m_notebook->GetPageCount() == 1 )
-        m_notebook->SetTabCtrlHeight( 0 );
-    else
-        m_notebook->SetTabCtrlHeight( -1 );
+    // 始终保留顶部标签栏，便于单窗口工作台切换
+    m_notebook->SetTabCtrlHeight( -1 );
 }
 
 
 void KICAD_MANAGER_FRAME::onNotebookPageCountChanged( wxAuiNotebookEvent& evt )
 {
     HideTabsIfNeeded();
+
+    if( s_tabCoordinator )
+        s_tabCoordinator->SyncMenuBarToActiveTab();
 }
 
 
@@ -358,6 +1121,38 @@ void KICAD_MANAGER_FRAME::onNotebookPageCloseRequest( wxAuiNotebookEvent& evt )
 {
     wxAuiNotebook* notebook = (wxAuiNotebook*) evt.GetEventObject();
     wxWindow*      page = notebook->GetPage( evt.GetSelection() );
+
+    // 处理嵌入的编辑器标签页（原理图 / PCB / 3D 查看器 / 符号 / 封装编辑器）
+    if( auto* hostPage = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( page ) )
+    {
+        // 先拦截直接销毁，交由对应编辑器走原生 Close() 流程（触发未保存提示）
+        evt.Veto();
+
+        wxFrame* target = hostPage->GetEmbeddedFrame();
+        if( target && IsFrameInTopLevelList( target ) )
+        {
+            CallAfter(
+                    [target]()
+                    {
+                        if( IsFrameInTopLevelList( target ) )
+                        {
+                            if( target->Close( false ) && s_tabCoordinator )
+                                s_tabCoordinator->RemoveTabForFrame( target );
+                        }
+                    } );
+        }
+        else if( s_tabCoordinator )
+        {
+            CallAfter(
+                    []()
+                    {
+                        if( s_tabCoordinator )
+                            s_tabCoordinator->CleanupClosedTabs();
+                    } );
+        }
+
+        return;
+    }
 
     if( PANEL_NOTEBOOK_BASE* panel = dynamic_cast<PANEL_NOTEBOOK_BASE*>( page ) )
     {
@@ -394,9 +1189,6 @@ wxStatusBar* KICAD_MANAGER_FRAME::OnCreateStatusBar( int number, long style, wxW
     for( size_t i = 0; i < sbFieldCnt; i++ )
         sbFieldSizes[i] = sb->GetStatusWidth( static_cast<int>( i ) );
 
-    // Field 0 (the project path) is the only stretchable field so it uses all the leftover width
-    // before ellipsizing. Field 1 gets a fixed width sized to its watcher text; longer content
-    // (archive progress) is ellipsized rather than allowed to steal the path's width.
     if( sbFieldCnt > 0 )
         sbFieldSizes[0] = -1;
 
@@ -417,7 +1209,6 @@ wxStatusBar* KICAD_MANAGER_FRAME::OnCreateStatusBar( int number, long style, wxW
 
 void KICAD_MANAGER_FRAME::CreatePCM()
 {
-    // creates the PLUGIN_CONTENT_MANAGER, if not exists
     if( m_pcm )
         return;
 
@@ -447,7 +1238,7 @@ void KICAD_MANAGER_FRAME::CreatePCM()
                         {
                             updatePcmButtonBadge();
                         } );
-            });
+            } );
 
     m_pcm->SetRepositoryList( kicadSettings()->m_PcmRepositories );
 }
@@ -455,18 +1246,15 @@ void KICAD_MANAGER_FRAME::CreatePCM()
 
 void KICAD_MANAGER_FRAME::setupTools()
 {
-    // Create the manager
     m_toolManager = new TOOL_MANAGER;
     m_toolManager->SetEnvironment( nullptr, nullptr, nullptr, config(), this );
     m_actions = new KICAD_MANAGER_ACTIONS();
 
     m_toolDispatcher = new TOOL_DISPATCHER( m_toolManager );
 
-    // Attach the events to the tool dispatcher
     Bind( wxEVT_CHAR, &TOOL_DISPATCHER::DispatchWxEvent, m_toolDispatcher );
     Bind( wxEVT_CHAR_HOOK, &TOOL_DISPATCHER::DispatchWxEvent, m_toolDispatcher );
 
-    // Register tools
     m_toolManager->RegisterTool( new COMMON_CONTROL );
     m_toolManager->RegisterTool( new KICAD_MANAGER_CONTROL );
     m_toolManager->InitTools();
@@ -506,8 +1294,6 @@ void KICAD_MANAGER_FRAME::setupUIConditions()
 
     manager->SetConditions( KICAD_MANAGER_ACTIONS::showLocalHistory, ACTION_CONDITIONS().Check( historyCond ) );
 
-    // These are just here for text boxes, search boxes, etc. in places such as the standard
-    // file dialogs.
     manager->SetConditions( ACTIONS::cut,     ENABLE( SELECTION_CONDITIONS::ShowNever ) );
     manager->SetConditions( ACTIONS::copy,    ENABLE( SELECTION_CONDITIONS::ShowNever ) );
     manager->SetConditions( ACTIONS::paste,   ENABLE( SELECTION_CONDITIONS::ShowNever ) );
@@ -543,10 +1329,10 @@ void KICAD_MANAGER_FRAME::PreloadAllLibraries()
     CallAfter(
             [&]()
             {
-                KIFACE *schface = Kiway().KiFACE( KIWAY::FACE_SCH );
+                KIFACE* schface = Kiway().KiFACE( KIWAY::FACE_SCH );
                 schface->PreloadLibraries( &Kiway() );
 
-                KIFACE *pcbface = Kiway().KiFACE( KIWAY::FACE_PCB );
+                KIFACE* pcbface = Kiway().KiFACE( KIWAY::FACE_PCB );
                 pcbface->PreloadLibraries( &Kiway() );
 
                 Pgm().PreloadDesignBlockLibraries( &Kiway() );
@@ -569,37 +1355,37 @@ const wxString KICAD_MANAGER_FRAME::GetProjectFileName() const
 
 const wxString KICAD_MANAGER_FRAME::SchFileName()
 {
-   wxFileName   fn( GetProjectFileName() );
+    wxFileName fn( GetProjectFileName() );
 
-   fn.SetExt( FILEEXT::KiCadSchematicFileExtension );
-   return fn.GetFullPath();
+    fn.SetExt( FILEEXT::KiCadSchematicFileExtension );
+    return fn.GetFullPath();
 }
 
 
 const wxString KICAD_MANAGER_FRAME::SchLegacyFileName()
 {
-   wxFileName   fn( GetProjectFileName() );
+    wxFileName fn( GetProjectFileName() );
 
-   fn.SetExt( FILEEXT::LegacySchematicFileExtension );
-   return fn.GetFullPath();
+    fn.SetExt( FILEEXT::LegacySchematicFileExtension );
+    return fn.GetFullPath();
 }
 
 
 const wxString KICAD_MANAGER_FRAME::PcbFileName()
 {
-   wxFileName   fn( GetProjectFileName() );
+    wxFileName fn( GetProjectFileName() );
 
-   fn.SetExt( FILEEXT::PcbFileExtension );
-   return fn.GetFullPath();
+    fn.SetExt( FILEEXT::PcbFileExtension );
+    return fn.GetFullPath();
 }
 
 
 const wxString KICAD_MANAGER_FRAME::PcbLegacyFileName()
 {
-   wxFileName   fn( GetProjectFileName() );
+    wxFileName fn( GetProjectFileName() );
 
-   fn.SetExt( FILEEXT::LegacyPcbFileExtension );
-   return fn.GetFullPath();
+    fn.SetExt( FILEEXT::LegacyPcbFileExtension );
+    return fn.GetFullPath();
 }
 
 
@@ -626,15 +1412,15 @@ void KICAD_MANAGER_FRAME::OnSize( wxSizeEvent& event )
     if( m_auimgr.GetManagedWindow() )
         m_auimgr.Update();
 
+    if( s_tabCoordinator )
+        s_tabCoordinator->SyncActiveTabSize();
+
     event.Skip();
 }
 
 
 void KICAD_MANAGER_FRAME::DoWithAcceptedFiles()
 {
-    // All fileNames are now in m_AcceptedFiles vector.
-    // Check if contains a project file name and load project.
-    // If not, open files in dedicated app.
     for( const wxFileName& fileName : m_AcceptedFiles )
     {
         wxString ext = fileName.GetExt();
@@ -648,10 +1434,8 @@ void KICAD_MANAGER_FRAME::DoWithAcceptedFiles()
         }
     }
 
-    // Then stock gerber files in gerberFiles and run action for other files.
     wxString gerberFiles;
 
-    // Gerbview editor should be able to open Gerber and drill files
     for( const wxFileName& fileName : m_AcceptedFiles )
     {
         wxString ext = fileName.GetExt();
@@ -671,7 +1455,6 @@ void KICAD_MANAGER_FRAME::DoWithAcceptedFiles()
         }
     }
 
-    // Execute Gerbviewer
     if( !gerberFiles.IsEmpty() )
     {
         wxString fullEditorName = FindKicadFile( GERBVIEW_EXE );
@@ -701,11 +1484,11 @@ bool KICAD_MANAGER_FRAME::canCloseWindow( wxCloseEvent& aEvent )
         }
     }
 
-    // CloseProject will recursively ask all the open editors if they need to save changes.
-    // If any of them cancel then we need to cancel closing the KICAD_MANAGER_FRAME.
     if( CloseProject( true ) )
     {
-        // Don't propagate event to frames which have already been closed
+        if( s_tabCoordinator )
+            s_tabCoordinator->Shutdown();
+
         aEvent.StopPropagation();
 
         return true;
@@ -723,20 +1506,16 @@ bool KICAD_MANAGER_FRAME::canCloseWindow( wxCloseEvent& aEvent )
 void KICAD_MANAGER_FRAME::doCloseWindow()
 {
 #ifdef _WINDOWS_
-    // For some obscure reason, on Windows, when killing Kicad from the Windows task manager
-    // if a editor frame (schematic, library, board editor or fp editor) is open and has
-    // some edition to save, OnCloseWindow is run twice *at the same time*, creating race
-    // conditions between OnCloseWindow() code.
-    // Therefore I added (JPC) a ugly hack to discard the second call (unwanted) during
-    // execution of the first call (only one call is right).
-    // Note also if there is no change made in editors, this behavior does not happen.
     static std::atomic<unsigned int> lock_close_event( 0 );
 
-    if( ++lock_close_event > 1 )    // Skip extra calls
+    if( ++lock_close_event > 1 )
     {
         return;
     }
 #endif
+
+    if( s_tabCoordinator )
+        s_tabCoordinator->Shutdown();
 
     m_projectTreePane->Show( false );
     Pgm().m_Quitting = true;
@@ -744,7 +1523,7 @@ void KICAD_MANAGER_FRAME::doCloseWindow()
     Destroy();
 
 #ifdef _WINDOWS_
-    lock_close_event = 0;   // Reenable event management
+    lock_close_event = 0;
 #endif
 }
 
@@ -783,14 +1562,15 @@ bool KICAD_MANAGER_FRAME::CloseProject( bool aSave )
     if( !Kiway().PlayersClose( false ) )
         return false;
 
-    // Abort any in-progress background load, since the threads depend on the project not changing
-    KIFACE *schface = Kiway().KiFACE( KIWAY::FACE_SCH );
+    if( s_tabCoordinator )
+        s_tabCoordinator->CleanupClosedTabs();
+
+    KIFACE* schface = Kiway().KiFACE( KIWAY::FACE_SCH );
     schface->CancelPreload();
 
-    KIFACE *pcbface = Kiway().KiFACE( KIWAY::FACE_PCB );
+    KIFACE* pcbface = Kiway().KiFACE( KIWAY::FACE_PCB );
     pcbface->CancelPreload();
 
-    // Save the project file for the currently loaded project.
     if( m_active_project )
     {
         SETTINGS_MANAGER& mgr = Pgm().GetSettingsManager();
@@ -803,13 +1583,8 @@ bool KICAD_MANAGER_FRAME::CloseProject( bool aSave )
                 mgr.SaveProject();
         }
 
-        // Ensure the Last_Save tag is at HEAD before closing. This handles the case where
-        // autosave commits were made after the last explicit save - without this, the next
-        // project load would offer to restore the autosave state, which is incorrect after
-        // a clean close.
         wxString projPath = Prj().GetProjectPath();
 
-        // Wait for any in-flight autosave so the HEAD check below isn't racing it.
         Kiway().LocalHistory().WaitForPendingSave();
 
         if( Pgm().GetCommonSettings()->AutosaveUsesLocalHistory()
@@ -817,18 +1592,13 @@ bool KICAD_MANAGER_FRAME::CloseProject( bool aSave )
         {
             if( Kiway().LocalHistory().HeadNewerThanLastSave( projPath ) )
             {
-                // Tag unconditionally: even on no-op snapshots Last_Save must anchor at HEAD.
                 Kiway().LocalHistory().CommitFullProjectSnapshot( projPath, wxS( "Close" ) );
                 Kiway().LocalHistory().TagSave( projPath, wxS( "project" ) );
             }
         }
 
-        // The editors clean up autosaves for sheets actually dirtied in their session.
-        // Anything still on disk here was deferred by the user in the recovery dialog
-        // and must survive so the dialog can offer it again on the next open.
-
         m_active_project = false;
-        // Enforce local history size limit (if enabled) once all pending saves/backups are done.
+
         if( Pgm().GetCommonSettings()
                 && Pgm().GetCommonSettings()->AutosaveUsesLocalHistory() )
         {
@@ -841,8 +1611,6 @@ bool KICAD_MANAGER_FRAME::CloseProject( bool aSave )
             }
         }
 
-        // Unregister the project saver before unloading the project to prevent
-        // dangling references
         Kiway().LocalHistory().UnregisterSaver( &Prj() );
 
         mgr.UnloadProject( &Prj() );
@@ -850,7 +1618,6 @@ bool KICAD_MANAGER_FRAME::CloseProject( bool aSave )
 
     SetStatusText( "" );
 
-    // Traverse pages in reverse order so deleting them doesn't mess up our iterator.
     for( int i = (int) m_notebook->GetPageCount() - 1; i >= 0; i-- )
     {
         wxWindow* page = m_notebook->GetPage( i );
@@ -914,13 +1681,11 @@ void KICAD_MANAGER_FRAME::OpenJobsFile( const wxFileName& aFileName, bool aCreat
 
 bool KICAD_MANAGER_FRAME::LoadProject( const wxFileName& aProjectFileName )
 {
-    // The project file should be valid by the time we get here or something has gone wrong.
     if( !aProjectFileName.Exists() )
         return false;
 
     wxString fullPath = aProjectFileName.GetFullPath();
 
-    // Inspect only; SETTINGS_MANAGER::LoadProject() takes the real lock
     LOCKFILE lockFile = LOCKFILE::Inspect( fullPath );
 
     bool lockOverrideGranted = false;
@@ -934,30 +1699,21 @@ bool KICAD_MANAGER_FRAME::LoadProject( const wxFileName& aProjectFileName )
                     lockFile.GetHostname() );
 
         if( !AskOverrideLock( this, msg ) )
-            return false;  // User clicked Cancel - abort project loading entirely
+            return false;
 
-        // Clear the lock so the load below can take it
         LOCKFILE overridden( fullPath );
         overridden.OverrideLock();
 
         lockOverrideGranted = true;
     }
 
-    // Any open KIFACE's must be closed if they are not part of the new project.
-    // (We never want a KIWAY_PLAYER open on a KIWAY that isn't in the same project.)
-    // User is prompted here to close those KIWAY_PLAYERs:
     if( !CloseProject( true ) )
         return false;
 
     m_active_project = true;
 
-    // NB: when loading a legacy project SETTINGS_MANAGER::LoadProject() will convert it to
-    // current extension. Be very careful with aProjectFileName vs. Prj().GetProjectPath()
-    // from here on out.
-
     Pgm().GetSettingsManager().LoadProject( fullPath );
 
-    // Propagate lock override decision to the loaded project
     if( lockOverrideGranted )
         Prj().SetLockOverrideGranted( true );
 
@@ -983,19 +1739,15 @@ bool KICAD_MANAGER_FRAME::LoadProject( const wxFileName& aProjectFileName )
 
         if( dlg.ShowModal() == wxID_YES )
         {
-            // The dialog above is the confirmation, skip RestoreCommit's own prompt.
             Kiway().LocalHistory().RestoreCommit( Prj().GetProjectPath(), head, this, false );
         }
         else
         {
-            // User declined; commit on-disk state and tag unconditionally so Last_Save anchors
-            // at HEAD even if no new commit was needed.
             Kiway().LocalHistory().CommitFullProjectSnapshot( Prj().GetProjectPath(), wxS( "Declined restore" ) );
             Kiway().LocalHistory().TagSave( Prj().GetProjectPath(), wxS( "project" ) );
         }
     }
 
-    // Save history & window state to disk now.  Don't wait around for a crash.
     KICAD_SETTINGS* settings = kicadSettings();
     SaveSettings( settings );
     settings->SaveToFile( Pgm().GetSettingsManager().GetPathForSettingsFile( settings ) );
@@ -1012,12 +1764,8 @@ bool KICAD_MANAGER_FRAME::LoadProject( const wxFileName& aProjectFileName )
             OpenJobsFile( jobsetFn.GetFullPath(), false, false );
     }
 
-    // Always start with the apps page
     m_notebook->SetSelection( 0 );
 
-    // Rebuild the list of watched paths.
-    // however this is possible only when the main loop event handler is running,
-    // so we use it to run the rebuild function.
     wxCommandEvent cmd( wxEVT_COMMAND_MENU_SELECTED, ID_INIT_WATCHED_PATHS );
 
     wxPostEvent( this, cmd );
@@ -1029,8 +1777,6 @@ bool KICAD_MANAGER_FRAME::LoadProject( const wxFileName& aProjectFileName )
 
     KIPLATFORM::ENV::AddToRecentDocs( aProjectFileName.GetFullPath() );
 
-    // Now that we have a new project, trigger a library preload, which will load in any
-    // project-specific symbol and footprint libraries into the manager
     PreloadAllLibraries();
     return true;
 }
@@ -1041,7 +1787,6 @@ void KICAD_MANAGER_FRAME::CreateNewProject( const wxFileName& aProjectFileName, 
     wxCHECK_RET( aProjectFileName.DirExists() && aProjectFileName.IsDirWritable(),
                  "Project folder must exist and be writable to create a new project." );
 
-    // If the project is legacy, convert it
     if( !aProjectFileName.FileExists() )
     {
         wxFileName legacyPro( aProjectFileName );
@@ -1056,36 +1801,27 @@ void KICAD_MANAGER_FRAME::CreateNewProject( const wxFileName& aProjectFileName, 
         }
         else
         {
-            // Copy template project file from template folder.
             wxString srcFileName = sys_search().FindValidPath( "kicad.kicad_pro" );
 
             wxFileName destFileName( aProjectFileName );
             destFileName.SetExt( FILEEXT::ProjectFileExtension );
 
-            // Create a minimal project file if the template project file could not be copied
             if( !wxFileName::FileExists( srcFileName )
                 || !wxCopyFile( srcFileName, destFileName.GetFullPath() ) )
             {
                 wxFFile file( destFileName.GetFullPath(), "wb" );
 
                 if( file.IsOpened() )
-                    file.Write( wxT( "{\n}\n") );
-
-                // wxFFile dtor will close the file
+                    file.Write( wxT( "{\n}\n" ) );
             }
         }
     }
 
-    // Create a "stub" for a schematic root sheet and a board if requested.
-    // It will avoid messages from the schematic editor or the board editor to create a new file
-    // And forces the user to create main files under the right name for the project manager
     if( aCreateStubFiles )
     {
         wxFileName fn( aProjectFileName.GetFullPath() );
         fn.SetExt( FILEEXT::KiCadSchematicFileExtension );
 
-        // If a <project>.kicad_sch file does not exist, create a "stub" file ( minimal schematic
-        // file ).
         if( !fn.FileExists() )
         {
             wxFFile file( fn.GetFullPath(), "wb" );
@@ -1110,12 +1846,8 @@ void KICAD_MANAGER_FRAME::CreateNewProject( const wxFileName& aProjectFileName, 
                                               GetMajorMinorVersion(),
                                               KIID().AsString() ) );
             }
-
-            // wxFFile dtor will close the file
         }
 
-        // If a <project>.kicad_pcb or <project>.brd file does not exist,
-        // create a .kicad_pcb "stub" file
         fn.SetExt( FILEEXT::KiCadPcbFileExtension );
         wxFileName leg_fn( fn );
         leg_fn.SetExt( FILEEXT::LegacyPcbFileExtension );
@@ -1126,16 +1858,12 @@ void KICAD_MANAGER_FRAME::CreateNewProject( const wxFileName& aProjectFileName, 
 
             if( file.IsOpened() )
             {
-                // Create a small dummy file as a stub for pcbnew:
                 file.Write( wxString::Format( "(kicad_pcb (version %d) (generator \"pcbnew\") (generator_version \"%s\")\n)",
                                               SEXPR_BOARD_FILE_VERSION, GetMajorMinorVersion() ) );
             }
-
-            // wxFFile dtor will close the file
         }
     }
 
-    // Save history & window state to disk now.  Don't wait around for a crash.
     KICAD_SETTINGS* settings = kicadSettings();
     SaveSettings( settings );
     settings->SaveToFile( Pgm().GetSettingsManager().GetPathForSettingsFile( settings ) );
@@ -1159,11 +1887,6 @@ void KICAD_MANAGER_FRAME::OnCompareProjectBranches( wxCommandEvent& event )
         return;
     }
 
-    // Seed the picker with the conventional "MR" pair: an integration branch
-    // (main/master) as the base, the current branch as the head. Resolve the
-    // current branch from HEAD so a checked-out feature branch lands at
-    // index 1 (where DIALOG_GIT_MR_REVIEW selects its head ref) instead of
-    // the literal "HEAD" string.
     wxString currentBranch;
     git_reference* head = nullptr;
 
@@ -1205,12 +1928,10 @@ void KICAD_MANAGER_FRAME::OnCompareProjectBranches( wxCommandEvent& event )
 
 void KICAD_MANAGER_FRAME::OnOpenFileInTextEditor( wxCommandEvent& event )
 {
-    // show all files in file dialog (in Kicad all files are editable texts):
     wxString wildcard = FILEEXT::AllFilesWildcard();
-
     wxString default_dir = Prj().GetProjectPath();
 
-    wxFileDialog dlg( this, _( "Edit File in Text Editor" ), default_dir,  wxEmptyString, wildcard,
+    wxFileDialog dlg( this, _( "Edit File in Text Editor" ), default_dir, wxEmptyString, wildcard,
                       wxFD_OPEN );
 
     KIPLATFORM::UI::AllowNetworkFileSystems( &dlg );
@@ -1240,14 +1961,11 @@ void KICAD_MANAGER_FRAME::RefreshProjectTree()
 
 void KICAD_MANAGER_FRAME::ShowChangedLanguage()
 {
-    // call my base class
     EDA_BASE_FRAME::ShowChangedLanguage();
 
-    // tooltips in toolbars
     RecreateToolbars();
     m_launcher->CreateLaunchers();
 
-    // update captions
     int pageId = m_notebook->FindPage( m_launcher );
 
     if( pageId != wxNOT_FOUND )
@@ -1255,6 +1973,9 @@ void KICAD_MANAGER_FRAME::ShowChangedLanguage()
 
     m_auimgr.GetPane( m_projectTreePane ).Caption( PROJECT_FILES_CAPTION );
     m_auimgr.Update();
+
+    if( s_tabCoordinator )
+        s_tabCoordinator->RefreshMenuBarVisual();
 
     m_projectTreePane->FileWatcherReset();
 
@@ -1286,7 +2007,6 @@ void KICAD_MANAGER_FRAME::ProjectChanged()
 {
     wxString file = GetProjectFileName();
 
-    // empty file string means no project loaded
     if( !Prj().IsNullProject() &&
         Prj().GetProjectLock() == nullptr )
     {
@@ -1333,8 +2053,6 @@ void KICAD_MANAGER_FRAME::ProjectChanged()
 
     SetTitle( title );
 
-    // Register project file saver. Ensures project file participates in
-    // autosave history commits without affecting dirty state.
     Kiway().LocalHistory().RegisterSaver( &Prj(),
             [this]( const wxString& aProjectPath, std::vector<HISTORY_FILE_DATA>& aFileData )
             {
@@ -1388,11 +2106,9 @@ bool KICAD_MANAGER_FRAME::IsProjectActive()
 
 void KICAD_MANAGER_FRAME::OnIdle( wxIdleEvent& aEvent )
 {
-    /**
-     * We start loading the saved previously open windows on idle to avoid locking up the GUI
-     * earlier in project loading. This gives us the visual effect of a opened KiCad project but
-     * with a "busy" progress reporter
-     */
+    if( s_tabCoordinator )
+        s_tabCoordinator->ScanAndSyncFrames();
+
     if( !m_openSavedWindows )
         return;
 
@@ -1411,7 +2127,6 @@ void KICAD_MANAGER_FRAME::OnIdle( wxIdleEvent& aEvent )
         {
             APP_PROGRESS_DIALOG progressReporter( _( "Restoring session" ), wxEmptyString, previousOpenCount, this );
 
-            // We don't currently support opening more than one view per file
             std::set<wxString> openedFiles;
 
             int i = 0;
@@ -1442,19 +2157,15 @@ void KICAD_MANAGER_FRAME::OnIdle( wxIdleEvent& aEvent )
         }
     }
 
-    // clear file states regardless if we opened windows or not due to setting
     Prj().GetLocalSettings().ClearFileState();
 
-    // After restore from history, mark open editors as dirty so user is prompted to save
     if( m_restoredFromHistory )
     {
         m_restoredFromHistory = false;
 
-        // Mark schematic editor as dirty if open
         if( KIWAY_PLAYER* schFrame = Kiway().Player( FRAME_SCH, false ) )
             schFrame->OnModify();
 
-        // Mark PCB editor as dirty if open
         if( KIWAY_PLAYER* pcbFrame = Kiway().Player( FRAME_PCB_EDITOR, false ) )
             pcbFrame->OnModify();
     }
@@ -1470,15 +2181,6 @@ void KICAD_MANAGER_FRAME::OnIdle( wxIdleEvent& aEvent )
         m_pcm->RunBackgroundUpdate();
     }
 
-// #ifdef KICAD_UPDATE_CHECK
-//     if( !m_updateManager && settings->m_KiCadUpdateCheck )
-//     {
-//         m_updateManager = std::make_unique<UPDATE_MANAGER>();
-//         m_updateManager->CheckForUpdate( this );
-//     }
-// #endif
-
-    // This little diddy is needed to get the window put into the Mac dock icon's context menu.
     Raise();
 }
 
@@ -1512,8 +2214,6 @@ void KICAD_MANAGER_FRAME::updatePcmButtonBadge()
 
 void KICAD_MANAGER_FRAME::onToolbarSizeChanged()
 {
-    // No idea why, but the same mechanism used in EDA_DRAW_FRAME doesn't work here
-    // the only thing that seems to work is to blow it all up and start from scratch.
     m_auimgr.DetachPane( m_tbLeft );
     delete m_tbLeft;
     m_tbLeft = nullptr;
@@ -1544,7 +2244,7 @@ void KICAD_MANAGER_FRAME::RestoreCommitFromHistory( const wxString& aHash )
 
     if( Kiway().LocalHistory().RestoreCommit( Prj().GetProjectPath(), aHash, this ) )
     {
-        m_restoredFromHistory = true;  // Mark editors dirty when they reopen
+        m_restoredFromHistory = true;
     }
 
     m_projectTreePane->ReCreateTreePrj();
