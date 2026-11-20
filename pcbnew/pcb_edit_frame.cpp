@@ -2245,9 +2245,6 @@ void PCB_EDIT_FRAME::OnBoardLoaded()
         visibleLayers.reset( B_Fab );
         GetBoard()->SetVisibleLayers( visibleLayers );
     }
-
-    // Sync layer and item visibility
-    GetCanvas()->SyncLayersVisibility( m_pcb );
     // Sync layer and item visibility
     GetCanvas()->SyncLayersVisibility( m_pcb );
 
