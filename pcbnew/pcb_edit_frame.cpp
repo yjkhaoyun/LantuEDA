@@ -194,6 +194,35 @@ static void notifyLantuActivateTab( KIWAY& /*aKiway*/, wxWindow* aFrame )
     }
 }
 
+static std::unordered_map<const PCB_EDIT_FRAME*, bool> s_pcbLastHasSelection;
+
+static void syncLantuSmartPropertiesPane( PCB_EDIT_FRAME* aFrame, wxAuiManager& aAuiMgr )
+{
+    if( !aFrame || !aAuiMgr.GetManagedWindow() )
+        return;
+
+    wxAuiPaneInfo& propPane = aAuiMgr.GetPane( aFrame->PropertiesPaneName() );
+    if( !propPane.IsOk() )
+        return;
+
+    bool hasSel = !aFrame->GetCurrentSelection().Empty();
+    auto it = s_pcbLastHasSelection.find( aFrame );
+
+    if( it == s_pcbLastHasSelection.end() || it->second != hasSel )
+    {
+        s_pcbLastHasSelection[aFrame] = hasSel;
+
+        if( hasSel && propPane.dock_direction == wxAUI_DOCK_LEFT )
+            propPane.Right().Layer( 4 ).Position( 0 );
+
+        if( propPane.IsShown() != hasSel )
+        {
+            propPane.Show( hasSel );
+            aAuiMgr.Update();
+        }
+    }
+}
+
 wxDEFINE_EVENT( EDA_EVT_PCB_LAST_SCH_SHEET_CHANGED, wxCommandEvent );
 
 
@@ -485,6 +514,14 @@ PCB_EDIT_FRAME::PCB_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
         SetAuiPaneSize( m_auimgr, propertiesPanel, aui_cfg.properties_panel_width, -1 );
     }
 
+    if( !Kiface().IsSingle() )
+    {
+        // 单窗口模式下：将“属性”面板移至右侧与“外观”同列，且初始未选中对象时自动隐藏
+        m_auimgr.GetPane( PropertiesPaneName() ).Right().Layer( 4 ).Position( 0 ).Show( false );
+        s_pcbLastHasSelection[this] = false;
+        m_auimgr.Update();
+    }
+
     if( aui_cfg.search_panel_height > 0
         && ( aui_cfg.search_panel_dock_direction == wxAUI_DOCK_TOP
             || aui_cfg.search_panel_dock_direction == wxAUI_DOCK_BOTTOM ) )
@@ -545,6 +582,8 @@ PCB_EDIT_FRAME::PCB_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
                   m_lastNetnamesViewport = viewport;
               }
 
+              if( !Kiface().IsSingle() && !interactiveOperationInProgress() )
+                syncLantuSmartPropertiesPane( this, m_auimgr );
               // Do not forget to pass the Idle event to other clients:
               aEvent.Skip();
           } );
@@ -801,6 +840,7 @@ void PCB_EDIT_FRAME::OnCrossProbeFlashTimer( wxTimerEvent& aEvent )
 
 PCB_EDIT_FRAME::~PCB_EDIT_FRAME()
 {
+    s_pcbLastHasSelection.erase( this );
     // Always ensure that we are unregistered even in a close without graceful doCloseWindow()
     if( GetBoard() )
         Kiway().LocalHistory().UnregisterSaver( GetBoard() );
@@ -2497,6 +2537,9 @@ void PCB_EDIT_FRAME::UpdateProperties()
 {
     EDA_DRAW_FRAME::UpdateProperties();
     NotifyFindByPropertiesDialog();
+
+    if( !Kiface().IsSingle() && !interactiveOperationInProgress() )
+        syncLantuSmartPropertiesPane( this, m_auimgr );
 }
 
 

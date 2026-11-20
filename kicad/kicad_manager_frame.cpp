@@ -76,10 +76,12 @@
 #include <wx/dnd.h>
 #include <wx/menu.h>
 #include <wx/process.h>
+#include <wx/settings.h>
 #include <wx/timer.h>
 #include <wx/toplevel.h>
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <update_manager.h>
@@ -115,7 +117,7 @@
 
 
 // ============================================================================
-// LantuEDA 单窗口标签页宿主与全局动态菜单代理引擎（Windows 原生无缝嵌入）
+// LantuEDA 单窗口标签页工作台 & 顶部动态菜单栏引擎（对标嘉立创 EDA 空间布局）
 // ============================================================================
 namespace
 {
@@ -136,33 +138,59 @@ static bool IsFrameInTopLevelList( wxFrame* aFrame )
 
 
 /**
- * 顶部全局动态菜单栏：
- * 始终保持在主窗口最上方，根据当前激活的标签页自动呈现对应编辑器的 wxMenuBar，
- * 并通过 Win32 TrackPopupMenuEx 原生弹出真实菜单（完整保留所有 UpdateUI 状态、勾选与插件项）。
+ * 顶部全局动态菜单栏（含右侧快捷面板折叠按钮）：
+ * 1. 左侧自动映射当前激活标签页（开始页 / 原理图 / PCB / 3D视图等）的原生 wxMenuBar；
+ * 2. 右侧提供【工程栏】与【属性栏】一键显隐开关，随时释放最大画布空间。
  */
 class LANTU_PROXY_MENUBAR : public wxPanel
 {
 public:
     explicit LANTU_PROXY_MENUBAR( wxWindow* aParent )
-        : wxPanel( aParent, wxID_ANY, wxDefaultPosition, wxSize( -1, aParent->FromDIP( 26 ) ) ),
+        : wxPanel( aParent, wxID_ANY, wxDefaultPosition,
+                   wxSize( aParent->FromDIP( 1200 ), aParent->FromDIP( 28 ) ) ),
           m_targetFrame( nullptr ),
           m_hoverIdx( -1 ),
-          m_openIdx( -1 )
+          m_openIdx( -1 ),
+          m_hoverQuickBtn( 0 ),
+          m_isEditorActive( false ),
+          m_projectTreeVisible( true ),
+          m_propertiesVisible( false )
     {
+        SetMinSize( wxSize( FromDIP( 200 ), FromDIP( 28 ) ) );
+        SetMaxSize( wxSize( 10000, FromDIP( 28 ) ) );
         SetBackgroundStyle( wxBG_STYLE_PAINT );
         Bind( wxEVT_PAINT, &LANTU_PROXY_MENUBAR::OnPaint, this );
+        Bind( wxEVT_SIZE, &LANTU_PROXY_MENUBAR::OnSize, this );
         Bind( wxEVT_MOTION, &LANTU_PROXY_MENUBAR::OnMouseMove, this );
         Bind( wxEVT_LEAVE_WINDOW, &LANTU_PROXY_MENUBAR::OnMouseLeave, this );
         Bind( wxEVT_LEFT_DOWN, &LANTU_PROXY_MENUBAR::OnMouseDown, this );
     }
 
-    void SetTargetFrame( wxFrame* aFrame )
+    void SetCallbacks( std::function<void()> aOnToggleProjectTree,
+                       std::function<void()> aOnToggleProperties )
     {
-        if( m_targetFrame != aFrame )
+        m_onToggleProjectTree = std::move( aOnToggleProjectTree );
+        m_onToggleProperties  = std::move( aOnToggleProperties );
+    }
+
+    void SetTargetFrame( wxFrame* aFrame, bool aIsEditorActive )
+    {
+        if( m_targetFrame != aFrame || m_isEditorActive != aIsEditorActive )
         {
-            m_targetFrame = aFrame;
-            m_hoverIdx = -1;
-            m_openIdx = -1;
+            m_targetFrame    = aFrame;
+            m_isEditorActive = aIsEditorActive;
+            m_hoverIdx       = -1;
+            m_openIdx        = -1;
+            Refresh();
+        }
+    }
+
+    void SetQuickStates( bool aProjectTreeVisible, bool aPropertiesVisible )
+    {
+        if( m_projectTreeVisible != aProjectTreeVisible || m_propertiesVisible != aPropertiesVisible )
+        {
+            m_projectTreeVisible = aProjectTreeVisible;
+            m_propertiesVisible  = aPropertiesVisible;
             Refresh();
         }
     }
@@ -170,23 +198,107 @@ public:
     wxFrame* GetTargetFrame() const { return m_targetFrame; }
 
 private:
-    wxFrame*             m_targetFrame;
-    std::vector<wxRect>  m_itemRects;
-    int                  m_hoverIdx;
-    int                  m_openIdx;
+    wxFrame*              m_targetFrame;
+    std::vector<wxRect>   m_itemRects;
+    wxRect                m_btnProjectRect;
+    wxRect                m_btnPropsRect;
+    int                   m_hoverIdx;
+    int                   m_openIdx;
+    int                   m_hoverQuickBtn; // 0=none, 1=projectTree, 2=properties
+    bool                  m_isEditorActive;
+    bool                  m_projectTreeVisible;
+    bool                  m_propertiesVisible;
+    std::function<void()> m_onToggleProjectTree;
+    std::function<void()> m_onToggleProperties;
+
+    void OnSize( wxSizeEvent& aEvt )
+    {
+        Refresh();
+        aEvt.Skip();
+    }
+
+    void DrawQuickToggleButton( wxDC& aDC, const wxRect& aRect, const wxString& aLabel,
+                                bool aActive, bool aHover )
+    {
+        if( aHover )
+        {
+            aDC.SetBrush( wxBrush( wxColour( 222, 234, 252 ) ) );
+            aDC.SetPen( wxPen( wxColour( 150, 186, 240 ), 1 ) );
+            aDC.DrawRoundedRectangle( aRect, 4 );
+            aDC.SetTextForeground( wxColour( 20, 78, 175 ) );
+        }
+        else if( aActive )
+        {
+            aDC.SetBrush( wxBrush( wxColour( 235, 242, 252 ) ) );
+            aDC.SetPen( wxPen( wxColour( 192, 212, 242 ), 1 ) );
+            aDC.DrawRoundedRectangle( aRect, 4 );
+            aDC.SetTextForeground( wxColour( 28, 90, 190 ) );
+        }
+        else
+        {
+            aDC.SetBrush( wxBrush( wxColour( 244, 246, 249 ) ) );
+            aDC.SetPen( wxPen( wxColour( 218, 223, 230 ), 1 ) );
+            aDC.DrawRoundedRectangle( aRect, 4 );
+            aDC.SetTextForeground( wxColour( 90, 98, 110 ) );
+        }
+
+        wxSize tsz = aDC.GetTextExtent( aLabel );
+        int tx = aRect.x + ( aRect.width - tsz.x ) / 2;
+        int ty = aRect.y + ( aRect.height - tsz.y ) / 2;
+        aDC.DrawText( aLabel, tx, ty );
+    }
 
     void OnPaint( wxPaintEvent& )
     {
         wxAutoBufferedPaintDC dc( this );
         wxSize sz = GetClientSize();
+        if( sz.x <= 0 || sz.y <= 0 )
+            return;
 
-        dc.SetBrush( wxBrush( wxColour( 248, 249, 251 ) ) );
+        // 顶部菜单栏浅色底 + 底部分割线
+        dc.SetBrush( wxBrush( wxColour( 248, 250, 252 ) ) );
         dc.SetPen( *wxTRANSPARENT_PEN );
         dc.DrawRectangle( 0, 0, sz.x, sz.y );
 
-        dc.SetPen( wxPen( wxColour( 218, 223, 230 ), 1 ) );
+        dc.SetPen( wxPen( wxColour( 214, 220, 228 ), 1 ) );
         dc.DrawLine( 0, sz.y - 1, sz.x, sz.y - 1 );
 
+        wxFont font = wxSystemSettings::GetFont( wxSYS_DEFAULT_GUI_FONT );
+        dc.SetFont( font );
+
+        // 1. 右侧绘制快捷面板开关按钮（工程栏 / 属性栏）
+        m_btnProjectRect = wxRect();
+        m_btnPropsRect   = wxRect();
+
+        int rightEdge = sz.x - FromDIP( 8 );
+        const int btnPadX = FromDIP( 10 );
+        const int btnH    = sz.y - FromDIP( 6 );
+        const int btnY    = FromDIP( 3 );
+
+        if( m_isEditorActive )
+        {
+            wxString propsTxt = m_propertiesVisible
+                    ? wxString::FromUTF8( "隐藏属性" )
+                    : wxString::FromUTF8( "显示属性" );
+            wxSize ptsz = dc.GetTextExtent( propsTxt );
+            int bw = ptsz.x + btnPadX * 2;
+            m_btnPropsRect = wxRect( rightEdge - bw, btnY, bw, btnH );
+            DrawQuickToggleButton( dc, m_btnPropsRect, propsTxt, m_propertiesVisible, m_hoverQuickBtn == 2 );
+            rightEdge = m_btnPropsRect.x - FromDIP( 6 );
+        }
+
+        {
+            wxString prjTxt = m_projectTreeVisible
+                    ? wxString::FromUTF8( "隐藏工程栏" )
+                    : wxString::FromUTF8( "显示工程栏" );
+            wxSize tsz = dc.GetTextExtent( prjTxt );
+            int bw = tsz.x + btnPadX * 2;
+            m_btnProjectRect = wxRect( rightEdge - bw, btnY, bw, btnH );
+            DrawQuickToggleButton( dc, m_btnProjectRect, prjTxt, m_projectTreeVisible, m_hoverQuickBtn == 1 );
+            rightEdge = m_btnProjectRect.x - FromDIP( 10 );
+        }
+
+        // 2. 左侧绘制当前激活编辑器的原生菜单栏项
         m_itemRects.clear();
 
         if( !m_targetFrame || !IsFrameInTopLevelList( m_targetFrame ) )
@@ -196,19 +308,23 @@ private:
         if( !mb )
             return;
 
-        wxFont font = GetFont();
-        dc.SetFont( font );
-
-        int x = FromDIP( 4 );
+        int x = FromDIP( 6 );
         const int padX = FromDIP( 9 );
         const size_t count = mb->GetMenuCount();
 
         for( size_t i = 0; i < count; ++i )
         {
             wxString label = mb->GetMenuLabelText( i );
+            if( label.IsEmpty() )
+                label = mb->GetMenuLabel( i );
+
             wxSize textSz = dc.GetTextExtent( label );
             int itemW = textSz.x + padX * 2;
-            wxRect rect( x, FromDIP( 2 ), itemW, sz.y - FromDIP( 4 ) );
+
+            if( x + itemW > rightEdge )
+                break;
+
+            wxRect rect( x, FromDIP( 2 ), itemW, sz.y - FromDIP( 5 ) );
             m_itemRects.push_back( rect );
 
             bool isActive = ( static_cast<int>( i ) == m_openIdx );
@@ -217,20 +333,20 @@ private:
             if( isActive )
             {
                 dc.SetBrush( wxBrush( wxColour( 208, 226, 250 ) ) );
-                dc.SetPen( wxPen( wxColour( 150, 188, 240 ), 1 ) );
+                dc.SetPen( wxPen( wxColour( 146, 186, 240 ), 1 ) );
                 dc.DrawRoundedRectangle( rect, 3 );
-                dc.SetTextForeground( wxColour( 20, 75, 165 ) );
+                dc.SetTextForeground( wxColour( 18, 72, 168 ) );
             }
             else if( isHover )
             {
-                dc.SetBrush( wxBrush( wxColour( 228, 235, 245 ) ) );
+                dc.SetBrush( wxBrush( wxColour( 228, 236, 248 ) ) );
                 dc.SetPen( *wxTRANSPARENT_PEN );
                 dc.DrawRoundedRectangle( rect, 3 );
-                dc.SetTextForeground( wxColour( 30, 35, 45 ) );
+                dc.SetTextForeground( wxColour( 24, 32, 46 ) );
             }
             else
             {
-                dc.SetTextForeground( wxColour( 40, 45, 55 ) );
+                dc.SetTextForeground( wxColour( 38, 44, 54 ) );
             }
 
             int textY = rect.y + ( rect.height - textSz.y ) / 2;
@@ -240,7 +356,7 @@ private:
         }
     }
 
-    int HitTest( const wxPoint& aPt ) const
+    int HitTestMenu( const wxPoint& aPt ) const
     {
         for( size_t i = 0; i < m_itemRects.size(); ++i )
         {
@@ -250,28 +366,56 @@ private:
         return -1;
     }
 
+    int HitTestQuickBtn( const wxPoint& aPt ) const
+    {
+        if( !m_btnProjectRect.IsEmpty() && m_btnProjectRect.Contains( aPt ) )
+            return 1;
+        if( !m_btnPropsRect.IsEmpty() && m_btnPropsRect.Contains( aPt ) )
+            return 2;
+        return 0;
+    }
+
     void OnMouseMove( wxMouseEvent& aEvt )
     {
-        int idx = HitTest( aEvt.GetPosition() );
-        if( idx != m_hoverIdx )
+        wxPoint pt = aEvt.GetPosition();
+        int idx = HitTestMenu( pt );
+        int qbtn = HitTestQuickBtn( pt );
+
+        if( idx != m_hoverIdx || qbtn != m_hoverQuickBtn )
         {
-            m_hoverIdx = idx;
+            m_hoverIdx      = idx;
+            m_hoverQuickBtn = qbtn;
             Refresh();
         }
     }
 
     void OnMouseLeave( wxMouseEvent& )
     {
-        if( m_hoverIdx != -1 )
+        if( m_hoverIdx != -1 || m_hoverQuickBtn != 0 )
         {
-            m_hoverIdx = -1;
+            m_hoverIdx      = -1;
+            m_hoverQuickBtn = 0;
             Refresh();
         }
     }
 
     void OnMouseDown( wxMouseEvent& aEvt )
     {
-        int idx = HitTest( aEvt.GetPosition() );
+        wxPoint pt = aEvt.GetPosition();
+
+        int qbtn = HitTestQuickBtn( pt );
+        if( qbtn == 1 && m_onToggleProjectTree )
+        {
+            m_onToggleProjectTree();
+            return;
+        }
+        if( qbtn == 2 && m_onToggleProperties )
+        {
+            m_onToggleProperties();
+            return;
+        }
+
+        int idx = HitTestMenu( pt );
         if( idx < 0 || !m_targetFrame || !IsFrameInTopLevelList( m_targetFrame ) )
             return;
 
@@ -302,7 +446,7 @@ private:
             ::PostMessage( topHwnd, WM_NULL, 0, 0 );
         }
 #endif
-        m_openIdx = -1;
+        m_openIdx  = -1;
         m_hoverIdx = -1;
         Refresh();
     }
@@ -310,7 +454,7 @@ private:
 
 
 /**
- * 标签页内部宿主面板：用于承载一个被 Win32 SetParent 嵌入的独立 KiCad 编辑器 wxFrame。
+ * 标签页内部宿主面板：承载一个被 Win32 SetParent 嵌入的独立 KiCad 编辑器 wxFrame。
  */
 class LANTU_EMBEDDED_FRAME_PAGE : public wxPanel
 {
@@ -344,7 +488,6 @@ public:
         if( !childHwnd || !hostHwnd || !::IsWindow( childHwnd ) )
             return;
 
-        // 剥离独立标题栏、边框、最大化状态与任务栏入口
         LONG_PTR style = ::GetWindowLongPtr( childHwnd, GWL_STYLE );
         style &= ~( WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
                     | WS_SYSMENU | WS_BORDER | WS_DLGFRAME | WS_MAXIMIZE | WS_MINIMIZE );
@@ -355,7 +498,6 @@ public:
         exStyle &= ~( WS_EX_APPWINDOW | WS_EX_WINDOWEDGE | WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE );
         ::SetWindowLongPtr( childHwnd, GWL_EXSTYLE, exStyle );
 
-        // 隐藏原生子窗口菜单条（已由顶部 LANTU_PROXY_MENUBAR 统一接管）
         if( ::GetMenu( childHwnd ) != nullptr )
             ::SetMenu( childHwnd, nullptr );
 
@@ -398,7 +540,6 @@ public:
         if( ::GetParent( childHwnd ) != hostHwnd )
             AttachFrame();
 
-        // 若编辑器内部重建了菜单栏或触发了最大化标志，立刻重新归位
         if( ::GetMenu( childHwnd ) != nullptr )
             ::SetMenu( childHwnd, nullptr );
 
@@ -474,15 +615,21 @@ private:
 
 
 /**
- * 单窗口标签调度中心：
- * 监控所有打开的 KiCad 编辑器窗口并自动收入 m_notebook 标签栏，统一同步顶部菜单与标签标题。
+ * 单窗口标签调度与空间布局优化中心：
+ * 1. 自动收纳原理图 / PCB / 3D 查看器 / 符号与封装编辑器为顶部标签页；
+ * 2. 切到编辑器标签页时自动隐藏主壳多余的左侧工具栏与底部重复状态栏；
+ * 3. 自动整理原理图与 PCB 内部的停靠面板，消除左侧死空白属性框。
  */
 class LANTU_TAB_COORDINATOR : public wxEvtHandler
 {
 public:
-    LANTU_TAB_COORDINATOR( KICAD_MANAGER_FRAME* aManager, wxAuiNotebook* aNotebook,
-                           LANTU_PROXY_MENUBAR* aMenuBar )
+    LANTU_TAB_COORDINATOR( KICAD_MANAGER_FRAME* aManager, wxAuiManager* aAuiMgr,
+                           wxWindow* aProjectTreePane, wxWindow* aLeftToolbar,
+                           wxAuiNotebook* aNotebook, LANTU_PROXY_MENUBAR* aMenuBar )
         : m_manager( aManager ),
+          m_auiMgr( aAuiMgr ),
+          m_projectTreePane( aProjectTreePane ),
+          m_leftToolbar( aLeftToolbar ),
           m_notebook( aNotebook ),
           m_menuBar( aMenuBar ),
           m_shuttingDown( false )
@@ -492,20 +639,31 @@ public:
         m_notebook->Bind( wxEVT_AUINOTEBOOK_PAGE_CHANGED, &LANTU_TAB_COORDINATOR::OnPageChanged, this );
 
         if( m_menuBar )
-            m_menuBar->SetTargetFrame( m_manager );
+        {
+            m_menuBar->SetCallbacks(
+                    [this]() { ToggleProjectTree(); },
+                    [this]() { ToggleActivePropertiesPane(); } );
+            m_menuBar->SetTargetFrame( m_manager, false );
+        }
 
 #ifdef __WXMSW__
         if( m_manager )
             ::SetMenu( reinterpret_cast<HWND>( m_manager->GetHWND() ), nullptr );
 #endif
 
-        // 120ms 轻量轮询，即时捕获原理图/PCB/3D查看器等任意 KIFACE 新建窗口
+        SyncChromeToActiveTab();
         m_timer.Start( 120 );
     }
 
     ~LANTU_TAB_COORDINATOR() override
     {
         Shutdown();
+    }
+
+    void SetLeftToolbar( wxWindow* aLeftToolbar )
+    {
+        m_leftToolbar = aLeftToolbar;
+        SyncChromeToActiveTab();
     }
 
     void Shutdown()
@@ -553,7 +711,7 @@ public:
             }
         }
 
-        SyncMenuBarToActiveTab();
+        SyncChromeToActiveTab();
     }
 
     void RemoveTabForFrame( wxFrame* aFrame )
@@ -568,7 +726,7 @@ public:
             {
                 host->DetachFrame();
                 m_notebook->DeletePage( i );
-                SyncMenuBarToActiveTab();
+                SyncChromeToActiveTab();
                 return;
             }
         }
@@ -579,7 +737,6 @@ public:
         if( m_shuttingDown || !m_notebook || !aFrame )
             return;
 
-        // 若该窗口尚未被嵌入，先立即嵌入
         if( FindPageIndexByFrame( aFrame ) == wxNOT_FOUND && ShouldEmbedFrame( aFrame ) )
             EmbedFrame( aFrame );
 
@@ -595,7 +752,7 @@ public:
                 host->FocusEmbeddedFrame();
             }
 
-            SyncMenuBarToActiveTab();
+            SyncChromeToActiveTab();
         }
     }
 
@@ -610,25 +767,134 @@ public:
             if( auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( sel ) ) )
                 host->SyncChildSize();
         }
+
+        if( m_menuBar )
+            m_menuBar->Refresh();
     }
 
-    void SyncMenuBarToActiveTab()
+    wxFrame* GetActiveEmbeddedFrame() const
     {
-        if( !m_menuBar || !m_notebook || !m_manager )
-            return;
+        if( !m_notebook )
+            return nullptr;
 
-        wxFrame* target = m_manager;
         int sel = m_notebook->GetSelection();
         if( sel >= 0 && static_cast<size_t>( sel ) < m_notebook->GetPageCount() )
         {
             if( auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( sel ) ) )
             {
                 if( wxFrame* f = host->GetEmbeddedFrame(); f && IsFrameInTopLevelList( f ) )
-                    target = f;
+                    return f;
+            }
+        }
+        return nullptr;
+    }
+
+    void ToggleProjectTree()
+    {
+        if( !m_auiMgr || !m_projectTreePane )
+            return;
+
+        wxAuiPaneInfo& pane = m_auiMgr->GetPane( m_projectTreePane );
+        if( pane.IsOk() )
+        {
+            pane.Show( !pane.IsShown() );
+            m_auiMgr->Update();
+            SyncActiveTabSize();
+            SyncChromeToActiveTab();
+        }
+    }
+
+    void ToggleActivePropertiesPane()
+    {
+        wxFrame* activeFrame = GetActiveEmbeddedFrame();
+        if( !activeFrame )
+            return;
+
+        wxAuiManager* childAui = wxAuiManager::GetManager( activeFrame );
+        if( !childAui )
+            return;
+
+        wxAuiPaneInfoArray& panes = childAui->GetAllPanes();
+        for( size_t i = 0; i < panes.GetCount(); ++i )
+        {
+            wxAuiPaneInfo& p = panes.Item( i );
+            if( p.name.Lower().Contains( wxS( "properties" ) ) )
+            {
+                bool nextShow = !p.IsShown();
+                if( nextShow && p.dock_direction == wxAUI_DOCK_LEFT )
+                    p.Right().Layer( 4 ).Position( 0 );
+                p.Show( nextShow );
+                childAui->Update();
+                break;
             }
         }
 
-        m_menuBar->SetTargetFrame( target );
+        SyncChromeToActiveTab();
+    }
+
+    void SyncChromeToActiveTab()
+    {
+        if( m_shuttingDown || !m_manager || !m_notebook )
+            return;
+
+        wxFrame* activeEditor = GetActiveEmbeddedFrame();
+        bool isEditorTab = ( activeEditor != nullptr );
+        wxFrame* menuTarget = isEditorTab ? activeEditor : static_cast<wxFrame*>( m_manager );
+
+        // 1. 切到编辑器标签页时，自动隐藏主外壳的左侧工具栏与底部重复状态栏（减少窗中窗感）
+        bool needAuiUpdate = false;
+        if( m_auiMgr && m_leftToolbar )
+        {
+            wxAuiPaneInfo& tbPane = m_auiMgr->GetPane( m_leftToolbar );
+            if( tbPane.IsOk() && tbPane.IsShown() == isEditorTab )
+            {
+                tbPane.Show( !isEditorTab );
+                needAuiUpdate = true;
+            }
+        }
+
+        if( wxStatusBar* sb = m_manager->GetStatusBar() )
+        {
+            if( sb->IsShown() == isEditorTab )
+            {
+                sb->Show( !isEditorTab );
+                m_manager->SendSizeEvent();
+            }
+        }
+
+        if( needAuiUpdate )
+        {
+            m_auiMgr->Update();
+            SyncActiveTabSize();
+        }
+
+        // 2. 更新顶部动态菜单栏目标与快捷开关高亮状态
+        if( m_menuBar )
+        {
+            m_menuBar->SetTargetFrame( menuTarget, isEditorTab );
+
+            bool prjShown = m_auiMgr && m_projectTreePane
+                    && m_auiMgr->GetPane( m_projectTreePane ).IsShown();
+            bool propShown = false;
+
+            if( activeEditor )
+            {
+                if( wxAuiManager* childAui = wxAuiManager::GetManager( activeEditor ) )
+                {
+                    wxAuiPaneInfoArray& panes = childAui->GetAllPanes();
+                    for( size_t i = 0; i < panes.GetCount(); ++i )
+                    {
+                        if( panes.Item( i ).name.Lower().Contains( wxS( "properties" ) ) )
+                        {
+                            propShown = panes.Item( i ).IsShown();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            m_menuBar->SetQuickStates( prjShown, propShown );
+        }
     }
 
     void ScanAndSyncFrames()
@@ -637,12 +903,10 @@ public:
             return;
 
 #ifdef __WXMSW__
-        // 防止主窗口重建菜单栏后恢复出双菜单栏
         HWND mgrHwnd = reinterpret_cast<HWND>( m_manager->GetHWND() );
         if( mgrHwnd && ::GetMenu( mgrHwnd ) != nullptr )
             ::SetMenu( mgrHwnd, nullptr );
 
-        // 1. 扫描所有新打开的编辑器窗口并嵌入标签栏
         std::vector<wxFrame*> toEmbed;
         for( wxWindow* win : wxTopLevelWindows )
         {
@@ -663,7 +927,6 @@ public:
         for( wxFrame* frame : toEmbed )
             EmbedFrame( frame );
 
-        // 2. 维护已有标签页（同步标题与 * 未保存星号、清理已关闭页、修正尺寸）
         for( int i = static_cast<int>( m_notebook->GetPageCount() ) - 1; i >= 0; --i )
         {
             auto* host = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( m_notebook->GetPage( i ) );
@@ -687,7 +950,7 @@ public:
         }
 #endif
 
-        SyncMenuBarToActiveTab();
+        SyncChromeToActiveTab();
     }
 
     void RefreshMenuBarVisual()
@@ -698,6 +961,9 @@ public:
 
 private:
     KICAD_MANAGER_FRAME* m_manager;
+    wxAuiManager*        m_auiMgr;
+    wxWindow*            m_projectTreePane;
+    wxWindow*            m_leftToolbar;
     wxAuiNotebook*       m_notebook;
     LANTU_PROXY_MENUBAR* m_menuBar;
     wxTimer              m_timer;
@@ -723,14 +989,12 @@ private:
         if( !edaFrame )
             return false;
 
-        // 排除主管理器本身及需要模态浮动的选型器/查看器弹窗
         if( edaFrame->IsType( KICAD_MAIN_FRAME_T ) )
             return false;
 
         if( ( aFrame->GetWindowStyleFlag() & wxFRAME_FLOAT_ON_PARENT ) != 0 )
             return false;
 
-        // 核心编辑器全部纳入单窗口顶部标签页
         if( edaFrame->IsType( FRAME_SCH )
             || edaFrame->IsType( FRAME_PCB_EDITOR )
             || edaFrame->IsType( FRAME_PCB_DISPLAY3D )
@@ -742,7 +1006,6 @@ private:
             return true;
         }
 
-        // 兼容图片转换器、计算工具等子窗口
         wxString name = aFrame->GetName();
         if( name == wxS( "Frame3D" ) || name == wxS( "Bm2CmpFrame" ) || name == wxS( "PcbCalculatorFrame" ) )
             return true;
@@ -791,10 +1054,71 @@ private:
         return rawTitle.IsEmpty() ? wxString::FromUTF8( "编辑器" ) : rawTitle;
     }
 
+    /**
+     * 对标嘉立创 EDA：嵌入原理图等编辑器时，自动清理其左侧多余的属性/筛选空白面板，
+     * 统移至右侧并默认收起，确保全局左侧仅有唯一的【工程文件】树，最大化画布视野！
+     */
+    void OptimizeEmbeddedEditorLayout( wxFrame* aFrame )
+    {
+        auto* edaFrame = dynamic_cast<EDA_BASE_FRAME*>( aFrame );
+        if( !edaFrame )
+            return;
+
+        wxAuiManager* childAui = wxAuiManager::GetManager( aFrame );
+        if( !childAui )
+            return;
+
+        bool changed = false;
+        wxAuiPaneInfoArray& panes = childAui->GetAllPanes();
+
+        if( edaFrame->IsType( FRAME_SCH ) )
+        {
+            for( size_t i = 0; i < panes.GetCount(); ++i )
+            {
+                wxAuiPaneInfo& p = panes.Item( i );
+                wxString lname = p.name.Lower();
+
+                if( lname.Contains( wxS( "properties" ) ) )
+                {
+                    p.Right().Layer( 4 ).Position( 0 ).Show( false );
+                    changed = true;
+                }
+                else if( lname.Contains( wxS( "selectionfilter" ) ) )
+                {
+                    p.Right().Layer( 4 ).Position( 2 ).Show( false );
+                    changed = true;
+                }
+                else if( lname.Contains( wxS( "hierarchy" ) ) )
+                {
+                    p.Right().Layer( 4 ).Position( 1 ).Show( false );
+                    changed = true;
+                }
+            }
+        }
+        else if( edaFrame->IsType( FRAME_PCB_EDITOR ) )
+        {
+            for( size_t i = 0; i < panes.GetCount(); ++i )
+            {
+                wxAuiPaneInfo& p = panes.Item( i );
+                if( p.name.Lower().Contains( wxS( "properties" ) ) )
+                {
+                    // 移至右侧与“外观”同列，默认收起（选中对象时由 PCB_EDIT_FRAME 自动展开）
+                    p.Right().Layer( 4 ).Position( 0 ).Show( false );
+                    changed = true;
+                }
+            }
+        }
+
+        if( changed )
+            childAui->Update();
+    }
+
     void EmbedFrame( wxFrame* aFrame )
     {
         if( !aFrame || !m_notebook )
             return;
+
+        OptimizeEmbeddedEditorLayout( aFrame );
 
         auto* host = new LANTU_EMBEDDED_FRAME_PAGE( m_notebook, aFrame );
         wxString title = BuildTabTitle( aFrame );
@@ -802,7 +1126,6 @@ private:
         m_notebook->AddPage( host, title, true );
         m_notebook->SetTabCtrlHeight( -1 );
 
-        // 延迟一帧确保 AUI 完成布局后再精确铺满并聚焦画布
         m_manager->CallAfter( [this, aFrame]() {
             if( m_shuttingDown )
                 return;
@@ -815,7 +1138,7 @@ private:
                     h->FocusEmbeddedFrame();
                 }
             }
-            SyncMenuBarToActiveTab();
+            SyncChromeToActiveTab();
         } );
     }
 
@@ -827,7 +1150,7 @@ private:
     void OnPageChanged( wxAuiNotebookEvent& aEvt )
     {
         SyncActiveTabSize();
-        SyncMenuBarToActiveTab();
+        SyncChromeToActiveTab();
 
         int sel = m_notebook->GetSelection();
         if( sel >= 0 && static_cast<size_t>( sel ) < m_notebook->GetPageCount() )
@@ -896,9 +1219,9 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
         m_pcmButton( nullptr ),
         m_pcmUpdateCount( 0 )
 {
-    const int defaultLeftWinWidth = FromDIP( 250 );
+    const int defaultLeftWinWidth = FromDIP( 200 );
 
-    m_leftWinWidth = defaultLeftWinWidth; // Default value
+    m_leftWinWidth = defaultLeftWinWidth;
     m_aboutTitle = "LantuEDA";
 
     wxXmlDocument dummy;
@@ -909,7 +1232,6 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     Pgm().RegisterLibraryLoadStatusBar( (KISTATUSBAR*) GetStatusBar() );
     GetStatusBar()->SetFont( KIUI::GetStatusFont( this ) );
 
-    // Give an icon
     wxIcon icon;
     wxIconBundle icon_bundle;
 
@@ -942,10 +1264,12 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
 
     SetIcons( icon_bundle );
 
-    // Load the settings
     LoadSettings( config() );
 
-    // Left window: is the box which display tree project
+    // 将历史偏宽的左侧工程栏收敛至紧凑宽度（不挤占单窗口画布）
+    if( m_leftWinWidth > FromDIP( 240 ) || m_leftWinWidth < FromDIP( 160 ) )
+        m_leftWinWidth = defaultLeftWinWidth;
+
     m_projectTreePane = new PROJECT_TREE_PANE( this );
 
     setupTools();
@@ -959,18 +1283,23 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     m_auimgr.SetManagedWindow( this );
     m_auimgr.SetFlags( wxAUI_MGR_LIVE_RESIZE );
 
-    // 顶部统一全局动态菜单栏（随标签页切换自动变为对应编辑器的菜单）
+    // 修复后的顶部统一动态菜单栏（Resizable(true) + DockFixed(true) + dock_proportion=1 保证 100% 全宽显示）
     LANTU_PROXY_MENUBAR* proxyMenuBar = nullptr;
 #ifdef __WXMSW__
     proxyMenuBar = new LANTU_PROXY_MENUBAR( this );
-    m_auimgr.AddPane( proxyMenuBar,
-                      wxAuiPaneInfo().Name( wxS( "LantuGlobalMenuBar" ) )
-                                     .Top().Layer( 10 )
-                                     .CaptionVisible( false ).CloseButton( false )
-                                     .Gripper( false ).PaneBorder( false )
-                                     .Floatable( false ).Movable( false ).Resizable( false )
-                                     .BestSize( -1, FromDIP( 26 ) )
-                                     .MinSize( -1, FromDIP( 26 ) ) );
+    wxAuiPaneInfo menuPane;
+    menuPane.Name( wxS( "LantuGlobalMenuBar" ) )
+            .Top().Layer( 10 ).Row( 0 ).Position( 0 )
+            .CaptionVisible( false ).CloseButton( false )
+            .Gripper( false ).PaneBorder( false )
+            .Floatable( false ).Movable( false )
+            .Resizable( true )
+            .DockFixed( true )
+            .MinSize( FromDIP( 200 ), FromDIP( 28 ) )
+            .BestSize( FromDIP( 1600 ), FromDIP( 28 ) )
+            .MaxSize( 10000, FromDIP( 28 ) );
+    menuPane.dock_proportion = 1;
+    m_auimgr.AddPane( proxyMenuBar, menuPane );
 #endif
 
     m_auimgr.AddPane( m_tbLeft, EDA_PANE().VToolbar().Name( "TopMainToolbar" ).Left().Layer( 2 ) );
@@ -978,7 +1307,8 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     m_auimgr.AddPane( m_projectTreePane,
                       EDA_PANE().Palette().Name( "ProjectTree" ).Left().Layer( 1 )
                                 .Caption( PROJECT_FILES_CAPTION ).PaneBorder( false )
-                                .MinSize( m_leftWinWidth, -1 ).Floatable( false ).Movable( false ) );
+                                .MinSize( m_leftWinWidth, -1 ).BestSize( m_leftWinWidth, -1 )
+                                .Floatable( false ).Movable( false ) );
 
     m_historyPane = new LOCAL_HISTORY_PANE( this );
     m_auimgr.AddPane( m_historyPane,
@@ -1004,7 +1334,6 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
     m_notebook->Freeze();
     m_launcher->SetClosable( false );
     m_notebook->AddPage( m_launcher, EDITORS_CAPTION, false );
-    // 始终显示顶部标签栏，呈现单窗口多标签工作台风格
     m_notebook->SetTabCtrlHeight( -1 );
     m_notebook->Thaw();
 
@@ -1013,10 +1342,10 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
 
     m_auimgr.Update();
 
-    // 初始化 LantuEDA 单窗口多标签调度中心
-    s_tabCoordinator = std::make_unique<LANTU_TAB_COORDINATOR>( this, m_notebook, proxyMenuBar );
+    // 初始化单窗口多标签与空间优化调度中心
+    s_tabCoordinator = std::make_unique<LANTU_TAB_COORDINATOR>(
+            this, &m_auimgr, m_projectTreePane, m_tbLeft, m_notebook, proxyMenuBar );
 
-    // 响应来自 PCB / 原理图等子编辑器的跨标签跳转通知
     Bind( wxEVT_MENU,
           []( wxCommandEvent& aEvt )
           {
@@ -1028,36 +1357,26 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
           },
           ID_LANTU_ACTIVATE_TAB );
 
-    // Now the actual m_projectTreePane size is set, give it a reasonable min width
-    m_auimgr.GetPane( m_projectTreePane ).MinSize( defaultLeftWinWidth, FromDIP( 80 ) );
+    m_auimgr.GetPane( m_projectTreePane ).MinSize( FromDIP( 160 ), FromDIP( 80 ) );
 
-    wxSizer* mainSizer = GetSizer();
-
-    // 首次运行时默认最大化以提供宽敞的单窗口标签页视野
-    if( config()->m_Window.state.size_x == 0 && config()->m_Window.state.size_y == 0 )
-    {
-        if( mainSizer )
-        {
-            Layout();
-            mainSizer->Fit( this );
-            Center();
-        }
-        Maximize( true );
-    }
+    // 单窗口工作台默认最大化展开（避免旧配置中的小窗口尺寸挤占画布与工具栏）
+    CallAfter( [this]() {
+        if( !IsMaximized() && GetSize().x < FromDIP( 1280 ) )
+            Maximize( true );
+        if( s_tabCoordinator )
+            s_tabCoordinator->SyncActiveTabSize();
+    } );
 
     if( ADVANCED_CFG::GetCfg().m_HideVersionFromTitle )
         SetTitle( wxT( "LantuEDA" ) );
     else
         SetTitle( wxString( "LantuEDA " ) + GetMajorMinorVersion() );
 
-    // Do not let the messages window have initial focus
     m_projectTreePane->SetFocus();
 
-    // Init for dropping files
     m_acceptedExts.emplace( FILEEXT::ProjectFileExtension, &KICAD_MANAGER_ACTIONS::loadProject );
     m_acceptedExts.emplace( FILEEXT::LegacyProjectFileExtension, &KICAD_MANAGER_ACTIONS::loadProject );
 
-    // Gerber files
     m_acceptedExts.emplace( FILEEXT::GerberFileExtension, &KICAD_MANAGER_ACTIONS::viewDroppedGerbers );
     m_acceptedExts.emplace( FILEEXT::GerberJobFileExtension, &KICAD_MANAGER_ACTIONS::viewDroppedGerbers );
     m_acceptedExts.emplace( FILEEXT::DrillFileExtension, &KICAD_MANAGER_ACTIONS::viewDroppedGerbers );
@@ -1084,7 +1403,6 @@ KICAD_MANAGER_FRAME::~KICAD_MANAGER_FRAME()
     Pgm().GetNotificationsManager().UnregisterStatusBar( (KISTATUSBAR*) GetStatusBar() );
     Pgm().UnregisterLibraryLoadStatusBar( (KISTATUSBAR*) GetStatusBar() );
 
-    // Shutdown all running tools
     if( m_toolManager )
         m_toolManager->ShutdownAllTools();
 
@@ -1103,7 +1421,6 @@ KICAD_MANAGER_FRAME::~KICAD_MANAGER_FRAME()
 
 void KICAD_MANAGER_FRAME::HideTabsIfNeeded()
 {
-    // 始终保留顶部标签栏，便于单窗口工作台切换
     m_notebook->SetTabCtrlHeight( -1 );
 }
 
@@ -1113,7 +1430,7 @@ void KICAD_MANAGER_FRAME::onNotebookPageCountChanged( wxAuiNotebookEvent& evt )
     HideTabsIfNeeded();
 
     if( s_tabCoordinator )
-        s_tabCoordinator->SyncMenuBarToActiveTab();
+        s_tabCoordinator->SyncChromeToActiveTab();
 }
 
 
@@ -1122,10 +1439,8 @@ void KICAD_MANAGER_FRAME::onNotebookPageCloseRequest( wxAuiNotebookEvent& evt )
     wxAuiNotebook* notebook = (wxAuiNotebook*) evt.GetEventObject();
     wxWindow*      page = notebook->GetPage( evt.GetSelection() );
 
-    // 处理嵌入的编辑器标签页（原理图 / PCB / 3D 查看器 / 符号 / 封装编辑器）
     if( auto* hostPage = dynamic_cast<LANTU_EMBEDDED_FRAME_PAGE*>( page ) )
     {
-        // 先拦截直接销毁，交由对应编辑器走原生 Close() 流程（触发未保存提示）
         evt.Veto();
 
         wxFrame* target = hostPage->GetEmbeddedFrame();
@@ -2083,7 +2398,9 @@ void KICAD_MANAGER_FRAME::SaveSettings( APP_SETTINGS_BASE* aCfg )
 
     wxCHECK( settings, /*void*/ );
 
-    settings->m_LeftWinWidth = m_projectTreePane->GetSize().x;
+    if( m_projectTreePane && m_projectTreePane->IsShown() )
+        settings->m_LeftWinWidth = m_projectTreePane->GetSize().x;
+
     settings->m_ShowHistoryPanel = m_historyPane && m_auimgr.GetPane( m_historyPane ).IsShown();
 
     if( !m_isClosing )
@@ -2219,6 +2536,9 @@ void KICAD_MANAGER_FRAME::onToolbarSizeChanged()
     m_tbLeft = nullptr;
     RecreateToolbars();
     m_auimgr.AddPane( m_tbLeft, EDA_PANE().HToolbar().Name( "TopMainToolbar" ).Left().Layer( 2 ) );
+
+    if( s_tabCoordinator )
+        s_tabCoordinator->SetLeftToolbar( m_tbLeft );
 
     m_auimgr.Update();
 }
