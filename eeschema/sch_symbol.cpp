@@ -3864,8 +3864,6 @@ const BOX2I SCH_SYMBOL::GetBoundingBox() const
 
 void SCH_SYMBOL::GetMsgPanelInfo( EDA_DRAW_FRAME* aFrame, std::vector<MSG_PANEL_ITEM>& aList )
 {
-    wxString msg;
-
     SCH_EDIT_FRAME* schframe = dynamic_cast<SCH_EDIT_FRAME*>( aFrame );
     SCH_SHEET_PATH* currentSheet = schframe ? &schframe->GetCurrentSheet() : nullptr;
     wxString        currentVariant = Schematic() ? Schematic()->GetCurrentVariant() : wxString();
@@ -3886,78 +3884,333 @@ void SCH_SYMBOL::GetMsgPanelInfo( EDA_DRAW_FRAME* aFrame, std::vector<MSG_PANEL_
         if( GetDNP( currentSheet, currentVariant ) )
             msgs.Add( _( "DNP" ) );
 
-        msg = wxJoin( msgs, '|' );
-        msg.Replace( '|', wxS( ", " ) );
+        wxString exclMsg = wxJoin( msgs, '|' );
+        exclMsg.Replace( wxS( "|" ), wxS( ", " ) );
 
-        if( !msg.empty() )
-            aList.emplace_back( _( "Exclude from" ), msg );
+        if( !exclMsg.empty() )
+            aList.emplace_back( _( "Exclude from" ), exclMsg );
     };
 
-    // part and alias can differ if alias is not the root
+    // 读取符号或底层库符号中注入的扩展属性（如 商品类目、制造商编号、制造商、封装规格）
+    auto getCustomFieldText = [&]( const wxString& aKey ) -> wxString
+    {
+        for( const SCH_FIELD& f : m_fields )
+        {
+            if( f.GetUntranslatedName().IsSameAs( aKey, false ) || f.GetName().IsSameAs( aKey, false ) )
+            {
+                wxString val = f.GetText().Strip( wxString::both );
+
+                if( !val.IsEmpty() && val != wxS( "-" ) && val != wxS( "~" ) )
+                    return val;
+            }
+        }
+
+        if( m_part )
+        {
+            std::vector<SCH_FIELD*> libFields;
+            m_part->GetFields( libFields );
+
+            for( const SCH_FIELD* lf : libFields )
+            {
+                if( lf && ( lf->GetUntranslatedName().IsSameAs( aKey, false )
+                            || lf->GetName().IsSameAs( aKey, false ) ) )
+                {
+                    wxString val = lf->GetText().Strip( wxString::both );
+
+                    if( !val.IsEmpty() && val != wxS( "-" ) && val != wxS( "~" ) )
+                        return val;
+                }
+            }
+        }
+
+        return wxEmptyString;
+    };
+
+    auto isLcscCode = []( const wxString& aStr ) -> bool
+    {
+        if( aStr.Length() < 2 || ( aStr[0] != 'C' && aStr[0] != 'c' ) )
+            return false;
+
+        for( size_t i = 1; i < aStr.Length(); ++i )
+        {
+            wxUniChar ch = aStr[i];
+
+            if( ch < '0' || ch > '9' )
+                return false;
+        }
+
+        return true;
+    };
+
+    auto hasChineseChar = []( const wxString& aStr ) -> bool
+    {
+        for( wxUniChar ch : aStr )
+        {
+            if( ch.GetValue() >= 0x4E00 && ch.GetValue() <= 0x9FFF )
+                return true;
+        }
+
+        return false;
+    };
+
+    // 智能解析元器件中文名称（兼容中文类目、英文类目自动汉化及位号前缀兜底）
+    auto resolveFriendlyTypeName = [&]( const wxString& aRawCategory, const wxString& aRefText,
+                                        const wxString& aLibItemName ) -> wxString
+    {
+        wxString leaf = aRawCategory;
+
+        if( leaf.Contains( wxS( "/" ) ) )
+            leaf = leaf.AfterLast( '/' ).Strip( wxString::both );
+
+        if( !leaf.IsEmpty() )
+        {
+            if( hasChineseChar( leaf ) )
+                return leaf;
+
+            wxString lower = leaf.Lower();
+
+            if( lower.Contains( wxS( "mlcc" ) ) || lower.Contains( wxS( "ceramic capacitor" ) ) )
+                return wxString::FromUTF8( "贴片电容(MLCC)" );
+            if( lower.Contains( wxS( "tantalum" ) ) )
+                return wxString::FromUTF8( "钽电容" );
+            if( lower.Contains( wxS( "electrolytic" ) ) || lower.Contains( wxS( "aluminum" ) ) )
+                return wxString::FromUTF8( "电解电容" );
+            if( lower.Contains( wxS( "capacitor" ) ) )
+                return wxString::FromUTF8( "电容" );
+            if( lower.Contains( wxS( "resistor network" ) ) || lower.Contains( wxS( "resistor array" ) ) )
+                return wxString::FromUTF8( "排阻" );
+            if( lower.Contains( wxS( "resistor" ) ) )
+                return wxString::FromUTF8( "电阻" );
+            if( lower.Contains( wxS( "ferrite" ) ) || lower.Contains( wxS( "bead" ) ) )
+                return wxString::FromUTF8( "磁珠" );
+            if( lower.Contains( wxS( "inductor" ) ) || lower.Contains( wxS( "choke" ) ) )
+                return wxString::FromUTF8( "电感" );
+            if( lower.Contains( wxS( "tvs" ) ) || lower.Contains( wxS( "esd" ) ) )
+                return wxString::FromUTF8( "ESD/TVS保护管" );
+            if( lower.Contains( wxS( "zener" ) ) )
+                return wxString::FromUTF8( "稳压二极管" );
+            if( lower.Contains( wxS( "schottky" ) ) )
+                return wxString::FromUTF8( "肖特基二极管" );
+            if( lower.Contains( wxS( "led" ) ) || lower.Contains( wxS( "light emitting" ) ) )
+                return wxString::FromUTF8( "发光二极管(LED)" );
+            if( lower.Contains( wxS( "diode" ) ) || lower.Contains( wxS( "rectifier" ) ) )
+                return wxString::FromUTF8( "二极管" );
+            if( lower.Contains( wxS( "mosfet" ) ) )
+                return wxString::FromUTF8( "MOS场效应管" );
+            if( lower.Contains( wxS( "transistor" ) ) || lower.Contains( wxS( "bjt" ) ) )
+                return wxString::FromUTF8( "三极管" );
+            if( lower.Contains( wxS( "crystal" ) ) || lower.Contains( wxS( "oscillator" ) )
+                || lower.Contains( wxS( "resonator" ) ) )
+                return wxString::FromUTF8( "晶振" );
+            if( lower.Contains( wxS( "wifi" ) ) || lower.Contains( wxS( "bluetooth" ) )
+                || lower.Contains( wxS( "wireless" ) ) || lower.Contains( wxS( "rf module" ) ) )
+                return wxString::FromUTF8( "无线通信模组" );
+            if( lower.Contains( wxS( "ldo" ) ) || lower.Contains( wxS( "dropout" ) )
+                || lower.Contains( wxS( "linear regulator" ) ) )
+                return wxString::FromUTF8( "线性稳压器(LDO)" );
+            if( lower.Contains( wxS( "dc-dc" ) ) || lower.Contains( wxS( "switching regulator" ) )
+                || lower.Contains( wxS( "buck" ) ) || lower.Contains( wxS( "boost" ) ) )
+                return wxString::FromUTF8( "电源管理芯片" );
+            if( lower.Contains( wxS( "microcontroller" ) ) || lower.Contains( wxS( "mcu" ) ) )
+                return wxString::FromUTF8( "单片机(MCU)" );
+            if( lower.Contains( wxS( "audio" ) ) || lower.Contains( wxS( "codec" ) )
+                || lower.Contains( wxS( "amplifier" ) ) )
+                return wxString::FromUTF8( "音频/功放芯片" );
+            if( lower.Contains( wxS( "usb" ) ) || lower.Contains( wxS( "type-c" ) ) )
+                return wxString::FromUTF8( "USB连接器" );
+            if( lower.Contains( wxS( "connector" ) ) || lower.Contains( wxS( "header" ) )
+                || lower.Contains( wxS( "terminal" ) ) || lower.Contains( wxS( "socket" ) ) )
+                return wxString::FromUTF8( "连接器" );
+            if( lower.Contains( wxS( "switch" ) ) || lower.Contains( wxS( "button" ) ) )
+                return wxString::FromUTF8( "开关/按键" );
+            if( lower.Contains( wxS( "fuse" ) ) )
+                return wxString::FromUTF8( "保险丝" );
+
+            return leaf;
+        }
+
+        if( !isLcscCode( aLibItemName ) && !aLibItemName.IsEmpty() )
+            return aLibItemName;
+
+        wxString prefix = UTIL::GetRefDesPrefix( aRefText ).Upper();
+        if( prefix == wxS( "C" ) )  return wxString::FromUTF8( "电容" );
+        if( prefix == wxS( "R" ) )  return wxString::FromUTF8( "电阻" );
+        if( prefix == wxS( "L" ) || prefix == wxS( "FB" ) ) return wxString::FromUTF8( "电感/磁珠" );
+        if( prefix == wxS( "D" ) )  return wxString::FromUTF8( "二极管" );
+        if( prefix == wxS( "Q" ) )  return wxString::FromUTF8( "晶体管" );
+        if( prefix == wxS( "Y" ) || prefix == wxS( "X" ) )  return wxString::FromUTF8( "晶振" );
+        if( prefix == wxS( "J" ) || prefix == wxS( "CN" ) ) return wxString::FromUTF8( "连接器" );
+        if( prefix == wxS( "SW" ) || prefix == wxS( "KEY" ) ) return wxString::FromUTF8( "开关/按键" );
+        if( prefix == wxS( "F" ) )  return wxString::FromUTF8( "保险丝" );
+
+        return wxString::FromUTF8( "集成电路" );
+    };
+
+    // 过滤供商城 SQL 搜索使用的同义词堆砌与重复封装，仅保留干净的核心技术参数
+    auto cleanSpecDescription = []( const wxString& aRawDesc, const wxString& aVal,
+                                    const wxString& aPkg ) -> wxString
+    {
+        if( aRawDesc.IsEmpty() )
+            return wxEmptyString;
+
+        if( !aRawDesc.Contains( wxS( "|" ) ) )
+            return aRawDesc;
+
+        std::vector<wxString> segments;
+        wxString rest = aRawDesc;
+
+        while( !rest.IsEmpty() )
+        {
+            int pos = rest.Find( '|' );
+            if( pos == wxNOT_FOUND )
+            {
+                segments.push_back( rest.Strip( wxString::both ) );
+                break;
+            }
+            segments.push_back( rest.Left( static_cast<size_t>( pos ) ).Strip( wxString::both ) );
+            rest = rest.Mid( static_cast<size_t>( pos ) + 1 );
+        }
+
+        wxString paramSeg;
+        std::vector<wxString> otherSegs;
+
+        for( const wxString& seg : segments )
+        {
+            if( seg.IsEmpty() )
+                continue;
+
+            if( seg.IsSameAs( aVal, false ) || seg.IsSameAs( aPkg, false ) )
+                continue;
+
+            if( seg.Contains( wxString::FromUTF8( "电容 MLCC" ) )
+                || seg.Contains( wxString::FromUTF8( "纳法" ) )
+                || seg.Contains( wxString::FromUTF8( "微法" ) )
+                || seg.Contains( wxString::FromUTF8( "皮法" ) )
+                || seg.Contains( wxString::FromUTF8( "欧姆" ) )
+                || seg.Contains( wxString::FromUTF8( "MOS管 晶体管" ) )
+                || seg.Contains( wxString::FromUTF8( "连接器 接插件" ) ) )
+            {
+                continue;
+            }
+
+            if( paramSeg.IsEmpty() && seg.Contains( wxS( ":" ) ) )
+                paramSeg = seg;
+            else
+                otherSegs.push_back( seg );
+        }
+
+        if( !paramSeg.IsEmpty() )
+            return paramSeg;
+
+        wxString joined;
+        for( const wxString& s : otherSegs )
+        {
+            if( !joined.IsEmpty() )
+                joined += wxS( " | " );
+            joined += s;
+        }
+
+        return joined;
+    };
+
     if( m_part )
     {
         if( m_part.get() != LIB_SYMBOL::GetDummy() )
         {
             if( m_part->IsPower() )
             {
-                // Don't use GetShownText(); we want to see the variable references here
                 aList.emplace_back( _( "Power symbol" ),
                                     KIUI::EllipsizeStatusText( aFrame, GetField( FIELD_T::VALUE )->GetText() ) );
+                return;
+            }
+
+            wxString refText     = UnescapeString( GetRef( currentSheet ) );
+            wxString valText     = GetField( FIELD_T::VALUE )->GetText().Strip( wxString::both );
+            wxString libItemName = GetLibId().GetLibItemName();
+            wxString categoryRaw = getCustomFieldText( wxString::FromUTF8( "商品类目" ) );
+            wxString mpnText     = getCustomFieldText( wxString::FromUTF8( "制造商编号" ) );
+            wxString brandText   = getCustomFieldText( wxString::FromUTF8( "制造商" ) );
+            wxString pkgSpec     = getCustomFieldText( wxString::FromUTF8( "封装规格" ) );
+
+            // 1. 位号
+            aList.emplace_back( _( "Reference" ), refText );
+
+            // 2. 名称（如：贴片电容(MLCC)、WiFi模组，不再把 C880604 误显示为名称）
+            wxString friendlyName = resolveFriendlyTypeName( categoryRaw, refText, libItemName );
+            aList.emplace_back( _( "Name" ), friendlyName );
+
+            // 3. 智能区分“数值”与“型号”：
+            //    - 阻容感晶振（Value != 制造商编号）：同时展示【数值: 100nF】与【型号: 原厂料号】
+            //    - 芯片/模组/分立件（Value == 制造商编号）：直接展示为【型号: ESP32-S3-WROOM-1-N16R8】
+            wxString refPrefix = UTIL::GetRefDesPrefix( refText ).Upper();
+            bool isPassivePrefix = ( refPrefix == wxS( "C" ) || refPrefix == wxS( "R" )
+                                     || refPrefix == wxS( "L" ) || refPrefix == wxS( "FB" )
+                                     || refPrefix == wxS( "Y" ) || refPrefix == wxS( "X" )
+                                     || refPrefix == wxS( "F" ) || refPrefix == wxS( "RN" ) );
+
+            if( !mpnText.IsEmpty() )
+            {
+                if( !valText.IsEmpty() && !valText.IsSameAs( mpnText, false ) )
+                {
+                    aList.emplace_back( _( "Value" ), valText );
+                    aList.emplace_back( wxString::FromUTF8( "型号" ), mpnText );
+                }
+                else
+                {
+                    aList.emplace_back( wxString::FromUTF8( "型号" ), mpnText );
+                }
+            }
+            else if( !valText.IsEmpty() )
+            {
+                if( isPassivePrefix )
+                    aList.emplace_back( _( "Value" ), valText );
+                else
+                    aList.emplace_back( wxString::FromUTF8( "型号" ), valText );
+            }
+
+            addExcludes();
+
+            // 4. 品牌
+            if( !brandText.IsEmpty() && brandText != wxString::FromUTF8( "未知品牌" ) )
+                aList.emplace_back( wxString::FromUTF8( "品牌" ), brandText );
+
+            // 5. 封装（优先展示精简封装规格如 0402 / SMD,25.5x18mm，释放底部横向空间）
+            wxString rawFp = GetField( FIELD_T::FOOTPRINT )->GetText().Strip( wxString::both );
+            wxString fpDisplay;
+
+            if( !pkgSpec.IsEmpty() && !pkgSpec.IsSameAs( wxS( "SMD" ), false ) )
+            {
+                fpDisplay = pkgSpec;
+            }
+            else if( !rawFp.IsEmpty() )
+            {
+                fpDisplay = rawFp.Contains( wxS( ":" ) ) ? rawFp.AfterFirst( ':' ) : rawFp;
+                if( fpDisplay.StartsWith( libItemName + wxS( "_" ) ) )
+                    fpDisplay = fpDisplay.Mid( libItemName.Length() + 1 );
             }
             else
             {
-                aList.emplace_back( _( "Reference" ), UnescapeString( GetRef( currentSheet ) ) );
-
-                // Don't use GetShownText(); we want to see the variable references here
-                aList.emplace_back( _( "Value" ),
-                                    KIUI::EllipsizeStatusText( aFrame, GetField( FIELD_T::VALUE )->GetText() ) );
-                addExcludes();
-                aList.emplace_back( _( "Name" ), KIUI::EllipsizeStatusText( aFrame, GetLibId().GetLibItemName() ) );
+                fpDisplay = _( "<Unknown>" );
             }
 
-#if 0 // Display symbol flags, for debug only
-            aList.emplace_back( _( "flags" ), wxString::Format( "%X", GetEditFlags() ) );
-#endif
+            aList.emplace_back( _( "Footprint" ), fpDisplay );
 
-            if( !m_part->IsRoot() )
-            {
-                msg = _( "Missing parent" );
-
-                std::shared_ptr<LIB_SYMBOL> parent = m_part->GetParent().lock();
-
-                if( parent )
-                    msg = parent->GetName();
-
-                aList.emplace_back( _( "Derived from" ), UnescapeString( msg ) );
-            }
+            // 6. 商城编号 / 符号库
+            if( isLcscCode( libItemName ) )
+                aList.emplace_back( wxString::FromUTF8( "编号" ), libItemName );
             else if( !m_lib_id.GetLibNickname().empty() )
-            {
                 aList.emplace_back( _( "Library" ), m_lib_id.GetLibNickname() );
-            }
-            else
-            {
-                aList.emplace_back( _( "Library" ), _( "Undefined!!!" ) );
-            }
 
-            // Display the current associated footprint, if exists.
-            // Don't use GetShownText(); we want to see the variable references here
-            msg = KIUI::EllipsizeStatusText( aFrame, GetField( FIELD_T::FOOTPRINT )->GetText() );
-
-            if( msg.IsEmpty() )
-                msg = _( "<Unknown>" );
-
-            aList.emplace_back( _( "Footprint" ), msg );
-
-            // Display description of the symbol, and keywords found in lib
-            aList.emplace_back( _( "Description" ) + wxT( ": " ) + GetField( FIELD_T::DESCRIPTION )->GetText(),
-                                _( "Keywords" ) + wxT( ": " ) + m_part->GetKeyWords() );
+            // 7. 参数（与其他列统一为上标题、下内容的整齐排版，不提前截断以便悬停/滚动/复制完整内容）
+            wxString cleanSpec = cleanSpecDescription( GetField( FIELD_T::DESCRIPTION )->GetText(), valText, pkgSpec );
+            if( !cleanSpec.IsEmpty() )
+                aList.emplace_back( wxString::FromUTF8( "参数" ), cleanSpec );
         }
     }
     else
     {
+        wxString msg;
         aList.emplace_back( _( "Reference" ), GetRef( currentSheet ) );
-
-        // Don't use GetShownText(); we want to see the variable references here
         aList.emplace_back( _( "Value" ), KIUI::EllipsizeStatusText( aFrame, GetField( FIELD_T::VALUE )->GetText() ) );
         addExcludes();
         aList.emplace_back( _( "Name" ), KIUI::EllipsizeStatusText( aFrame, GetLibId().GetLibItemName() ) );
